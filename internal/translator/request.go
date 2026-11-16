@@ -2,6 +2,9 @@ package translator
 
 import (
 	"9router/proxy/internal/log"
+	"9router/proxy/internal/thinking"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
@@ -65,8 +68,20 @@ func systemReminderText(content string) string {
 }
 
 func collapseTextParts(parts []OpenAIContentBlock) any {
-	if len(parts) == 1 && parts[0].Type == "text" {
-		return parts[0].Text
+	// Only flatten content when every part is text. Any non-text part
+	// (image_url, file, …) keeps the content as an array so vision models
+	// receive their image parts. For text-only parts, join into one string.
+	allText := true
+	texts := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p.Type != "text" {
+			allText = false
+			break
+		}
+		texts = append(texts, p.Text)
+	}
+	if allText {
+		return strings.Join(texts, "\n")
 	}
 	return parts
 }
@@ -329,17 +344,6 @@ func fixMissingToolResponsesOpenAI(messages []OpenAIMessage) []OpenAIMessage {
 	return result
 }
 
-func budgetToEffort(budget int) string {
-	switch {
-	case budget >= 20000:
-		return "high"
-	case budget >= 5000:
-		return "medium"
-	default:
-		return "low"
-	}
-}
-
 func convertToolChoice(choiceRaw *jsontext.Value) any {
 	if choiceRaw == nil {
 		return "auto"
@@ -385,6 +389,11 @@ func claudeDisablesParallelToolUse(choiceRaw jsontext.Value) bool {
 
 // TranslateClaudeToOpenAI converts a Claude request payload to an OpenAI request payload.
 func TranslateClaudeToOpenAI(claudeBody []byte) ([]byte, error) {
+	// The passthrough lane drops argumentless tool calls in
+	// SanitizeClaudePassthrough; a converted lane needs the same rule before the
+	// history is reshaped, or the model keeps reading its own bare call.
+	claudeBody = DropArgumentlessToolCalls(claudeBody)
+
 	var creq ClaudeRequest
 	if err := json.Unmarshal(claudeBody, &creq); err != nil {
 		return nil, fmt.Errorf("unmarshal Claude request body: %w", err)
@@ -445,10 +454,20 @@ func TranslateClaudeToOpenAI(claudeBody []byte) ([]byte, error) {
 		oreq.ParallelToolCalls = new(false)
 	}
 
-	// Claude thinking config → OpenAI reasoning_effort
+	// Claude thinking config → OpenAI reasoning_effort (unified maps).
 	if creq.Thinking != nil {
 		if creq.Thinking.Type == "enabled" {
-			oreq.ReasoningEffort = budgetToEffort(creq.Thinking.Budget)
+			if lvl := thinking.BudgetToLevel(creq.Thinking.Budget); lvl != "" {
+				oreq.ReasoningEffort = lvl
+			} else {
+				oreq.ReasoningEffort = "medium"
+			}
+		} else if creq.Thinking.Type == "disabled" {
+			// "none" is the OpenAI dialect the thinking pipeline reads. A
+			// provider that forbids disabling clamps it to minimal; one that
+			// allows it forwards the disable. Dropping it here would leave the
+			// client asking for no reasoning with the provider default.
+			oreq.ReasoningEffort = "none"
 		} else if creq.Thinking.Type == "adaptive" {
 			effort := "high"
 			if creq.OutputConfig != nil && creq.OutputConfig.Effort != "" {
@@ -470,7 +489,7 @@ func TranslateClaudeToOpenAI(claudeBody []byte) ([]byte, error) {
 		}
 	}
 
-	out, err := json.Marshal(oreq)
+	out, err := json.Marshal(oreq, json.Deterministic(true))
 	if err != nil {
 		return nil, fmt.Errorf("marshal OpenAI request: %w", err)
 	}
@@ -494,6 +513,111 @@ func TranslateClaudeToOpenAI(claudeBody []byte) ([]byte, error) {
 // client asked for and must survive untouched.
 var serverToolUseIDRegex = regexp.MustCompile(`^srvtoolu_[a-zA-Z0-9_]+$`)
 
+// claudeToolIDPattern is the Messages API's accepted tool id alphabet. Anthropic
+// answers 400 "tool_use.id: String should match pattern" for any id outside it.
+var claudeToolIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// SanitizeClaudeToolID rewrites an id to the Messages API alphabet.
+//
+// A tool call that came from another upstream — Codex, DeepSeek, Gemini, a
+// custom node — can carry '.', ':', '/' or spaces in its id. 9router used to
+// forward that id verbatim when translating the answer to Claude, the client
+// stored it in its transcript, and every later turn routed to Anthropic was
+// rejected with 400 until the turn aged out. The rewrite is deterministic
+// (sha256 of the original), so a tool_use and its tool_result still pair.
+func SanitizeClaudeToolID(id string) string {
+	if id == "" || claudeToolIDPattern.MatchString(id) {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return "toolu_" + hex.EncodeToString(sum[:])[:24]
+}
+
+// sanitizeClaudeToolIDs rewrites foreign tool ids in a Claude message array and
+// reports whether anything changed.
+func sanitizeClaudeToolIDs(messages []any) bool {
+	changed := false
+	for _, mRaw := range messages {
+		msg, ok := mRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		blocks, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, bRaw := range blocks {
+			block, ok := bRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			bType, _ := block["type"].(string)
+			field := ""
+			switch bType {
+			case "tool_use", "server_tool_use":
+				field = "id"
+			case "tool_result", "web_search_tool_result":
+				field = "tool_use_id"
+			}
+			if field == "" {
+				continue
+			}
+			id, _ := block[field].(string)
+			if next := SanitizeClaudeToolID(id); next != id {
+				block[field] = next
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// dropForeignBlockKeys removes `caller` from content blocks Anthropic does not
+// accept it on. `caller` is agent attribution and only the tool_use block
+// defines it; on a text block (or a text nested in a tool_result) the API
+// answers "messages.<n>.content.<m>.text.caller: Extra inputs are not
+// permitted" and refuses the whole request, so the turn poisons every later
+// one. tool_use keeps it — the field is valid there.
+func dropForeignBlockKeys(messages []any) bool {
+	changed := false
+	for _, mRaw := range messages {
+		msg, ok := mRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if scrubBlockCallers(msg["content"]) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// scrubBlockCallers walks one message's content array, including the blocks
+// nested in a tool_result, and reports whether a caller was removed.
+func scrubBlockCallers(content any) bool {
+	blocks, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, bRaw := range blocks {
+		block, ok := bRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if bType, _ := block["type"].(string); bType != "tool_use" {
+			if _, has := block["caller"]; has {
+				delete(block, "caller")
+				changed = true
+			}
+		}
+		if scrubBlockCallers(block["content"]) {
+			changed = true
+		}
+	}
+	return changed
+}
+
 func SanitizeClaudePassthrough(body []byte, intentionalPrefill bool) []byte {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -505,6 +629,13 @@ func SanitizeClaudePassthrough(body []byte, intentionalPrefill bool) []byte {
 	}
 	droppedIDs := make(map[string]bool)
 	changed := false
+
+	// A tool call that carries no arguments is never answerable: the client
+	// rejects it for missing required fields and resends the whole history, so
+	// the model reads its own bare call and repeats it. Dropping it here — and
+	// the tool_result paired with it, which the second pass removes through
+	// droppedIDs — stops the pattern instead of feeding it back.
+	dropArgumentlessToolUses(messagesRaw, droppedIDs, &changed)
 
 	// First pass: drop foreign server_tool_use and collect their ids
 	// Wrap bare content block objects into single-element array (parity with decolua/9router v0.5.75 #8a81085)
@@ -546,11 +677,10 @@ func SanitizeClaudePassthrough(body []byte, intentionalPrefill bool) []byte {
 					continue
 				}
 			}
-			// Strip empty text blocks (Anthropic 400s on empty text). The same
-			// emptiness rule decides whether the whole message survives below,
-			// so both read it from one place — a whitespace-only block must not
-			// slip through one pass and be dropped by the other.
-			if bType == "text" && !isContentfulBlock(block) {
+			// Strip empty text blocks and invalid thinking blocks. The same
+			// contentful rule decides whether the whole message survives below,
+			// so both read it from one place.
+			if (bType == "text" || bType == "thinking") && !isContentfulBlock(block) {
 				changed = true
 				continue
 			}
@@ -562,41 +692,8 @@ func SanitizeClaudePassthrough(body []byte, intentionalPrefill bool) []byte {
 	}
 
 	// Second pass: drop tool_result referencing dropped server_tool_use ids
-	if len(droppedIDs) > 0 {
-		for _, mRaw := range messagesRaw {
-			msgMap, ok := mRaw.(map[string]any)
-			if !ok {
-				continue
-			}
-			contentRaw, ok := msgMap["content"]
-			if !ok {
-				continue
-			}
-			blocks, ok := contentRaw.([]any)
-			if !ok {
-				continue
-			}
-			var kept []any
-			for _, bRaw := range blocks {
-				block, ok := bRaw.(map[string]any)
-				if !ok {
-					kept = append(kept, bRaw)
-					continue
-				}
-				bType, _ := block["type"].(string)
-				if bType == "tool_result" || bType == "web_search_tool_result" {
-					toolUseID, _ := block["tool_use_id"].(string)
-					if droppedIDs[toolUseID] {
-						changed = true
-						continue
-					}
-				}
-				kept = append(kept, bRaw)
-			}
-			if len(kept) != len(blocks) {
-				msgMap["content"] = kept
-			}
-		}
+	if dropToolResultsForIDs(messagesRaw, droppedIDs) {
+		changed = true
 	}
 
 	// Third pass: drop messages whose content carries nothing Anthropic accepts
@@ -609,15 +706,118 @@ func SanitizeClaudePassthrough(body []byte, intentionalPrefill bool) []byte {
 		messagesRaw = filtered
 		changed = true
 	}
+
+	// Drop Claude Code identity from the system field so it is not forwarded
+	// to the raw Anthropic API. Only the exact Claude Code banner prefix
+	// ("You are Claude Code...") is treated as identity; a user prompt such as
+	// "expert on Anthropic Agent SDK" is preserved. If removal empties the
+	// system field, the "system" key is deleted entirely rather than left as
+	// "" or [].
+	if systemVal, ok := req["system"]; ok {
+		cleaned := dropClaudeIdentitySystemBlock(systemVal)
+		before, _ := json.Marshal(systemVal)
+		after, _ := json.Marshal(cleaned)
+		if string(before) != string(after) {
+			if isEmptySystem(cleaned) {
+				delete(req, "system")
+			} else {
+				req["system"] = cleaned
+			}
+			changed = true
+		}
+	}
+
+	if sanitizeClaudeToolIDs(messagesRaw) {
+		changed = true
+	}
+	if dropForeignBlockKeys(messagesRaw) {
+		changed = true
+	}
 	if !changed {
 		return body
 	}
 	req["messages"] = messagesRaw
 
-	if out, err := json.Marshal(req); err == nil {
+	if out, err := json.Marshal(req, json.Deterministic(true)); err == nil {
 		return out
 	}
 	return body
+}
+
+// claudeIdentityBanner is the exact Claude Code system-prompt banner
+// prefix. Only a system block whose text starts with this banner is
+// treated as Claude Code identity and dropped; arbitrary user text that
+// merely mentions Claude Code or Agent SDK (e.g. "expert on Anthropic
+// Agent SDK") is preserved.
+const claudeIdentityBanner = "You are Claude Code"
+
+// isClaudeIdentityBanner reports whether s is the Claude Code system
+// banner (exact, case-insensitive prefix match).
+func isClaudeIdentityBanner(s string) bool {
+	s = strings.TrimSpace(s)
+	return strings.HasPrefix(strings.ToLower(s), strings.ToLower(claudeIdentityBanner))
+}
+
+// dropClaudeIdentitySystemBlock removes leading system blocks that carry
+// Claude Code identity, which are not appropriate for the raw Anthropic
+// API. system may be a string (legacy OpenAI shape) or an array of
+// content blocks [{type,text,...}]. Only leading blocks are dropped so
+// legitimate system text after them survives.
+func dropClaudeIdentitySystemBlock(system any) any {
+	switch s := system.(type) {
+	case string:
+		if isClaudeIdentityBanner(s) {
+			return ""
+		}
+		return system
+	case []any:
+		return dropLeadingIdentityBlocks(s)
+	default:
+		return system
+	}
+}
+
+// dropLeadingIdentityBlocks strips identity blocks from the front of a
+// system block array. It stops at the first non-identity block so
+// legitimate system text below survives.
+func dropLeadingIdentityBlocks(blocks []any) []any {
+	start := 0
+	for start < len(blocks) {
+		b, ok := blocks[start].(map[string]any)
+		if !ok {
+			break
+		}
+		if t, _ := b["type"].(string); t != "" && t != "text" {
+			break
+		}
+		text, _ := b["text"].(string)
+		if !isClaudeIdentityBanner(text) {
+			break
+		}
+		start++
+	}
+	if start == 0 {
+		return blocks
+	}
+	if start >= len(blocks) {
+		return []any{}
+	}
+	out := make([]any, 0, len(blocks)-start)
+	out = append(out, blocks[start:]...)
+	return out
+}
+
+// isEmptySystem reports whether a cleaned system value is empty and the
+// "system" key should be deleted entirely.
+func isEmptySystem(system any) bool {
+	switch s := system.(type) {
+	case string:
+		return strings.TrimSpace(s) == ""
+	case []any:
+		return len(s) == 0
+	default:
+		return system == nil
+	}
 }
 
 // DefaultClaudeToolType ensures all tools in a Claude-format request have a type (defaulting to "custom" if missing).
@@ -641,7 +841,7 @@ func DefaultClaudeToolType(body []byte) []byte {
 		}
 	}
 	if changed {
-		if out, err := json.Marshal(req); err == nil {
+		if out, err := json.Marshal(req, json.Deterministic(true)); err == nil {
 			return out
 		}
 	}
@@ -803,10 +1003,31 @@ func capCacheControlBlocks(req map[string]any) {
 	}
 }
 
-// AnchorClaudeCache ensures prompt-caching breakpoints land on system/tool head anchors,
+// Claude prompt-cache TTL choices for the head anchors.
+const (
+	ClaudeCacheTTL5m = "5m"
+	ClaudeCacheTTL1h = "1h"
+)
+
+// claudeCacheAnchor builds the head-anchor marker for one TTL. An unknown or
+// empty TTL keeps the default 5-minute window.
+func claudeCacheAnchor(ttl string) map[string]any {
+	if ttl == ClaudeCacheTTL1h {
+		return map[string]any{"type": "ephemeral", "ttl": ClaudeCacheTTL1h}
+	}
+	return map[string]any{"type": "ephemeral"}
+}
+
+// AnchorClaudeCache is AnchorClaudeCacheWithTTL at the default 5-minute window.
+func AnchorClaudeCache(body []byte) []byte { return AnchorClaudeCacheWithTTL(body, "") }
+
+// AnchorClaudeCacheWithTTL ensures prompt-caching breakpoints land on system/tool head anchors,
 // the tool loop's final tool results, and at most 4 cache_control markers are dispatched
 // (parity with #3567 / #8a81085a / upstream #49c761cd).
-func AnchorClaudeCache(body []byte) []byte {
+// ttl picks the head-anchor window: ClaudeCacheTTL1h costs 2x per written token but
+// survives an idle gap up to an hour; the empty string and ClaudeCacheTTL5m both use
+// the default 5-minute ephemeral marker.
+func AnchorClaudeCacheWithTTL(body []byte, ttl string) []byte {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body
@@ -830,8 +1051,8 @@ func AnchorClaudeCache(body []byte) []byte {
 					delete(m, "cache_control")
 				}
 				if i == last {
-					want := map[string]any{"type": "ephemeral", "ttl": "1h"}
-					if cur, ok := m["cache_control"].(map[string]any); !ok || cur["type"] != "ephemeral" || cur["ttl"] != "1h" {
+					want := claudeCacheAnchor(ttl)
+					if cur, ok := m["cache_control"].(map[string]any); !ok || cur["type"] != "ephemeral" || cur["ttl"] != want["ttl"] {
 						m["cache_control"] = want
 					}
 				} else if _, had := m["cache_control"]; had {
@@ -847,10 +1068,12 @@ func AnchorClaudeCache(body []byte) []byte {
 		for i, sb := range sys {
 			if m, ok := sb.(map[string]any); ok {
 				if i == lastSys {
-					want := map[string]any{"type": "ephemeral", "ttl": "1h"}
-					if cur, ok := m["cache_control"].(map[string]any); !ok || cur["type"] != "ephemeral" || cur["ttl"] != "1h" {
+					want := claudeCacheAnchor(ttl)
+					if cur, ok := m["cache_control"].(map[string]any); !ok || cur["type"] != "ephemeral" || cur["ttl"] != want["ttl"] {
 						m["cache_control"] = want
 					}
+				} else {
+					delete(m, "cache_control")
 				}
 			}
 		}
@@ -859,7 +1082,7 @@ func AnchorClaudeCache(body []byte) []byte {
 	// 4. Budget guard: if already >= the marker budget, cap and return
 	if countCacheControlBlocks(req) >= cacheControlMarkerBudget {
 		capCacheControlBlocks(req)
-		if out, err := json.Marshal(req); err == nil {
+		if out, err := json.Marshal(req, json.Deterministic(true)); err == nil {
 			return out
 		}
 		return body
@@ -872,6 +1095,163 @@ func AnchorClaudeCache(body []byte) []byte {
 	// 6. Ensure total cache_control blocks <= the marker budget.
 	capCacheControlBlocks(req)
 
+	out, err := json.Marshal(req, json.Deterministic(true))
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// emptyToolInput reports whether a tool_use block carries no arguments. A call
+// with none cannot be answered: Claude clients validate the call against the
+// tool schema and reject a missing required field.
+func emptyToolInput(input any) bool {
+	switch v := input.(type) {
+	case nil:
+		return true
+	case map[string]any:
+		return len(v) == 0
+	case string:
+		switch strings.TrimSpace(v) {
+		case "", "{}", "null":
+			return true
+		}
+	}
+	return false
+}
+
+// dropArgumentlessToolUses removes tool_use blocks that carry no arguments when
+// another call to the same tool in this conversation does carry them, recording
+// each removed id in droppedIDs so the paired tool_result goes with it.
+//
+// A tool that is only ever called bare — TodoWrite with an empty list, a
+// list-everything helper — never matches, so its calls survive untouched.
+func dropArgumentlessToolUses(messages []any, droppedIDs map[string]bool, changed *bool) {
+	withArgs := make(map[string]bool)
+	for _, mRaw := range messages {
+		msgMap, ok := mRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		blocks, ok := msgMap["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, bRaw := range blocks {
+			block, ok := bRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if bType, _ := block["type"].(string); bType != "tool_use" {
+				continue
+			}
+			name, _ := block["name"].(string)
+			if name != "" && !emptyToolInput(block["input"]) {
+				withArgs[name] = true
+			}
+		}
+	}
+	if len(withArgs) == 0 {
+		return
+	}
+
+	for _, mRaw := range messages {
+		msgMap, ok := mRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		blocks, ok := msgMap["content"].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(blocks))
+		for _, bRaw := range blocks {
+			block, ok := bRaw.(map[string]any)
+			if !ok {
+				kept = append(kept, bRaw)
+				continue
+			}
+			if bType, _ := block["type"].(string); bType == "tool_use" {
+				name, _ := block["name"].(string)
+				if withArgs[name] && emptyToolInput(block["input"]) {
+					if id, _ := block["id"].(string); id != "" {
+						droppedIDs[id] = true
+					}
+					*changed = true
+					continue
+				}
+			}
+			kept = append(kept, bRaw)
+		}
+		if len(kept) != len(blocks) {
+			msgMap["content"] = kept
+		}
+	}
+}
+
+// dropToolResultsForIDs removes tool_result blocks whose tool_use_id names a
+// call that is no longer in the conversation. Returns whether anything changed.
+func dropToolResultsForIDs(messages []any, droppedIDs map[string]bool) bool {
+	if len(droppedIDs) == 0 {
+		return false
+	}
+	changed := false
+	for _, mRaw := range messages {
+		msgMap, ok := mRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		blocks, ok := msgMap["content"].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(blocks))
+		for _, bRaw := range blocks {
+			block, ok := bRaw.(map[string]any)
+			if !ok {
+				kept = append(kept, bRaw)
+				continue
+			}
+			if bType, _ := block["type"].(string); bType == "tool_result" || bType == "web_search_tool_result" {
+				toolUseID, _ := block["tool_use_id"].(string)
+				if droppedIDs[toolUseID] {
+					changed = true
+					continue
+				}
+			}
+			kept = append(kept, bRaw)
+		}
+		if len(kept) != len(blocks) {
+			msgMap["content"] = kept
+		}
+	}
+	return changed
+}
+
+// DropArgumentlessToolCalls applies the argumentless-call rule to a Claude body
+// headed for a non-Claude lane, where SanitizeClaudePassthrough does not run.
+func DropArgumentlessToolCalls(body []byte) []byte {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	messagesRaw, ok := req["messages"].([]any)
+	if !ok || len(messagesRaw) == 0 {
+		return body
+	}
+	droppedIDs := make(map[string]bool)
+	changed := false
+	dropArgumentlessToolUses(messagesRaw, droppedIDs, &changed)
+	if dropToolResultsForIDs(messagesRaw, droppedIDs) {
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	if filtered, dropped := DropNonContentfulClaudeMessages(messagesRaw, ClaudeIntentionalPrefill(body)); dropped {
+		messagesRaw = filtered
+		req["messages"] = messagesRaw
+	}
 	out, err := json.Marshal(req)
 	if err != nil {
 		return body

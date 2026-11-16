@@ -15,6 +15,7 @@
     onBackToProviders,
     onMenuClick,
     onLogout,
+    onOpenSearch,
   }: {
     activeTab?: ActiveTab
     pageTitle?: string
@@ -23,6 +24,7 @@
     onBackToProviders?: () => void
     onMenuClick?: () => void
     onLogout?: () => void
+    onOpenSearch?: () => void
   } = $props()
 
   // The group invite rotates. Everything user-facing points at the redirect
@@ -176,6 +178,11 @@
       description: 'Live server console output',
       icon: 'terminal',
     },
+    jailbreak: {
+      title: 'Persona',
+      description: 'Per-model system-prompt injection and Gemini safety bypass',
+      icon: 'masks',
+    },
     settings: {
       title: 'Settings',
       description: 'Manage your preferences',
@@ -234,13 +241,13 @@
           <button
             type="button"
             onclick={onBackToProviders}
-            class="text-text-muted hover:text-primary transition-colors cursor-pointer text-sm font-normal"
+            class="hidden sm:block text-text-muted hover:text-primary transition-colors cursor-pointer text-sm font-normal"
           >
             Providers
           </button>
         </div>
         <div class="flex items-center gap-2 min-w-0">
-          <span class="material-symbols-outlined text-text-muted text-base">chevron_right</span>
+          <span class="hidden sm:inline material-symbols-outlined text-text-muted text-base">chevron_right</span>
           <div class="flex items-center gap-2 min-w-0">
             <ProviderIcon id={selectedProvider.id} size="sm" />
             <h1 class="text-base lg:text-2xl font-semibold text-text-main tracking-tight truncate">
@@ -251,7 +258,7 @@
       </div>
     {:else}
       <div class="flex items-center gap-2.5 min-w-0">
-        <span class="material-symbols-outlined text-primary text-xl lg:text-2xl flex-shrink-0">
+        <span class="hidden sm:block material-symbols-outlined text-primary text-xl lg:text-2xl flex-shrink-0">
           {currentMeta.icon}
         </span>
         <div class="min-w-0">
@@ -276,6 +283,20 @@
        English only, and the item's handler was an empty function, so clicking
        it did nothing (issue #240). -->
   <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+    <button
+      type="button"
+      onclick={() => onOpenSearch?.()}
+      title="Search models, providers, pages and settings (Ctrl+K)"
+      aria-label="Open search"
+      class="flex items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 py-1.5 text-xs text-text-muted transition-colors hover:border-brand-500/40 hover:text-text-main cursor-pointer"
+    >
+      <span class="material-symbols-outlined text-[16px]">search</span>
+      <span class="hidden sm:inline">Search</span>
+      <kbd
+        class="hidden lg:inline rounded border border-border bg-bg px-1 font-code text-[10px] text-text-subtle"
+        >Ctrl K</kbd
+      >
+    </button>
     <Menu label="Account and display options" triggerIcon="account_circle" minWidth="15rem">
       <MenuItem label="Donate" icon="volunteer_activism" onSelect={() => (isDonateOpen = true)} />
 

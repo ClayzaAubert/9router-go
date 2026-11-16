@@ -117,7 +117,7 @@ func rewriteCodexUpstreamModel(body []byte) []byte {
 		return body
 	}
 	m["model"] = upstream
-	out, err := json.Marshal(m)
+	out, err := marshalStable(m)
 	if err != nil {
 		return body
 	}
@@ -144,6 +144,7 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		MaxTokens           *int   `json:"max_tokens,omitempty"`
 		MaxCompletionTokens *int   `json:"max_completion_tokens,omitempty"`
 		MaxOutputTokens     *int   `json:"max_output_tokens,omitempty"`
+		PromptCacheKey      any    `json:"prompt_cache_key,omitempty"`
 	}
 	if err := json.Unmarshal(body, &quickCheck); err == nil && quickCheck.Input != nil {
 		var m map[string]any
@@ -152,6 +153,9 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 			m["model"] = cleanModel
 			m["stream"] = true
 			m["store"] = false
+			if quickCheck.PromptCacheKey != nil {
+				m["prompt_cache_key"] = quickCheck.PromptCacheKey
+			}
 			if m["max_output_tokens"] == nil {
 				if quickCheck.MaxCompletionTokens != nil {
 					m["max_output_tokens"] = *quickCheck.MaxCompletionTokens
@@ -225,6 +229,13 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 							pendingCallIDs = append(pendingCallIDs, cid)
 						case "function_call_output", "custom_tool_call_output":
 							cid, _ := itemMap["call_id"].(string)
+							// Codex also accepts function results addressed by name,
+							// without a preceding call. An invented id makes it
+							// require a matching call that does not exist.
+							name, _ := itemMap["name"].(string)
+							if itemType == "function_call_output" && cid == "" && strings.TrimSpace(name) != "" {
+								continue
+							}
 							if cid != "" {
 								for idx, p := range pendingCallIDs {
 									if p == cid {
@@ -260,8 +271,7 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 				}
 			}
 
-			applyCodexModelShape(m, cleanModel)
-			out, err := json.Marshal(m)
+			out, err := marshalStable(m)
 			return out, cleanModel, err
 		}
 	}
@@ -278,6 +288,8 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
 		Reasoning           any            `json:"reasoning,omitempty"`
 		Tools               jsontext.Value `json:"tools,omitempty"`
+		ToolChoice          jsontext.Value `json:"tool_choice,omitempty"`
+		ParallelToolCalls   *bool          `json:"parallel_tool_calls,omitempty"`
 		ResponseFormat      jsontext.Value `json:"response_format,omitempty"`
 		// ServiceTier is carried through unchanged. Upstream does the same in
 		// open-sse/translator/request/openai-responses.js, and the Chat
@@ -290,7 +302,8 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		// executor's rule, not the translator's — the Codex backend rewrites
 		// the field in normalizeCodexServiceTier, while the other Responses
 		// providers take it as sent.
-		ServiceTier jsontext.Value `json:"service_tier,omitempty"`
+		ServiceTier    jsontext.Value `json:"service_tier,omitempty"`
+		PromptCacheKey jsontext.Value `json:"prompt_cache_key,omitempty"`
 	}
 	if err := json.Unmarshal(body, &oreq); err != nil {
 		return nil, "", fmt.Errorf("parse request: %w", err)
@@ -377,11 +390,15 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 					cid = fmt.Sprintf("call_%d_%d", toolSeq, tcIdx)
 				}
 				pendingToolCallIDs = append(pendingToolCallIDs, cid)
+				args := tc.Function.Arguments
+				if name == "Agent" {
+					args = stripAgentIsolationFromArgs(args)
+				}
 				inputItems = append(inputItems, map[string]any{
 					"type":      "function_call",
 					"call_id":   clampCallID(cid),
 					"name":      name,
-					"arguments": tc.Function.Arguments,
+					"arguments": args,
 				})
 			}
 			toolSeq++
@@ -443,10 +460,19 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		if rEffort == "max" {
 			rEffort = "xhigh"
 		}
-		respReq["reasoning"] = map[string]any{
-			"effort":  rEffort,
+		reasoningMap := map[string]any{
 			"summary": "auto",
+			"effort":  rEffort,
 		}
+		if oreq.Reasoning != nil {
+			if existing, ok := oreq.Reasoning.(map[string]any); ok {
+				for k, v := range existing {
+					reasoningMap[k] = v
+				}
+				reasoningMap["effort"] = rEffort
+			}
+		}
+		respReq["reasoning"] = reasoningMap
 	} else if oreq.Reasoning != nil {
 		respReq["reasoning"] = oreq.Reasoning
 	}
@@ -510,6 +536,16 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 						}
 					}
 				}
+				if toolName, _ := tool["name"].(string); toolName == "Agent" {
+					if pMap, ok := tool["parameters"].(map[string]any); ok {
+						if props, ok := pMap["properties"].(map[string]any); ok {
+							delete(props, "isolation")
+						}
+					}
+				}
+				// Chat tools are non-strict by default; Responses may normalize
+				// omitted strict and make optional parameters mandatory.
+				tool["strict"] = false
 				if strict != nil {
 					tool["strict"] = *strict
 				}
@@ -520,7 +556,16 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 			}
 		}
 	}
-
+	// tool_choice must reach translateCodexClaudeWebSearchChoice before the
+	// model-shape rewrite, so it is decoded and carried over here rather than
+	// after. A jsontext.Value is preserved raw so an unknown or non-map value
+	// still passes through unchanged.
+	if oreq.ToolChoice.Kind() != jsontext.KindInvalid {
+		var tc any
+		if json.Unmarshal(oreq.ToolChoice, &tc) == nil {
+			respReq["tool_choice"] = tc
+		}
+	}
 	// Presence matters more than the value here: a client that sent null, "", a
 	// number or "fast" gets that byte for byte, because the destination decides
 	// what it means. Only a field the client never sent is dropped —
@@ -529,9 +574,17 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 	if oreq.ServiceTier.Kind() != jsontext.KindInvalid {
 		respReq["service_tier"] = oreq.ServiceTier
 	}
+	if oreq.PromptCacheKey.Kind() != jsontext.KindInvalid {
+		var pck any
+		if json.Unmarshal(oreq.PromptCacheKey, &pck) == nil && pck != nil {
+			respReq["prompt_cache_key"] = pck
+		}
+	}
 
-	applyCodexModelShape(respReq, cleanModel)
-	reqBody, err := json.Marshal(respReq)
+	if oreq.ParallelToolCalls != nil {
+		respReq["parallel_tool_calls"] = *oreq.ParallelToolCalls
+	}
+	reqBody, err := marshalStable(respReq)
 	return reqBody, cleanModel, err
 }
 
@@ -847,8 +900,41 @@ func normalizeTopLevelReasoning(reqMap map[string]any) bool {
 	return true
 }
 
+// deepSeekV4Pro is the wire id the deepseek -max/-none catalog aliases map to.
+const deepSeekV4Pro = "deepseek-v4-pro"
+
+var deepSeekV4ProAlias = map[string][2]string{
+	"deepseek-v4-pro-max":  {"enabled", "max"},
+	"deepseek-v4-pro-none": {"disabled", ""},
+}
+
+func applyDeepSeekV4ProAlias(reqMap map[string]any, modelLower string) bool {
+	alias, ok := deepSeekV4ProAlias[modelLower]
+	if !ok {
+		return false
+	}
+	reqMap["model"] = deepSeekV4Pro
+	reqMap["thinking"] = map[string]any{"type": alias[0]}
+
+	if alias[1] != "" {
+		reqMap["reasoning_effort"] = alias[1]
+	} else {
+		delete(reqMap, "reasoning_effort")
+	}
+	return true
+}
+
+// Closed value set gets a named type (repo AGENTS.md §4.C).
+type reasoningInjectScope int
+
+const (
+	reasoningInjectNone reasoningInjectScope = iota
+	reasoningInjectAll
+	reasoningInjectToolCalls
+)
+
 // InjectReasoningContent ensures assistant messages in request body have reasoning_content
-// injected (e.g. " " placeholder) for providers like opencode, deepseek, or kimi models,
+// injected (e.g. " " placeholder) for providers like opencode, deepseek, commandcode, or kimi models,
 // and strips foreign/unsupported keys (such as "reasoning", "thinking", "thought") that cause
 // upstream schema validation errors (e.g. "Unrecognized request argument supplied: messages[2].reasoning.").
 func InjectReasoningContent(body []byte, provider string) []byte {
@@ -865,15 +951,29 @@ func InjectReasoningContent(body []byte, provider string) []byte {
 	modelStr, _ := reqMap["model"].(string)
 	modelLower := strings.ToLower(modelStr)
 
+	scope := reasoningInjectNone
+	// Provider rule wins over model rules (upstream reasoningContentInjector.js: providerRule || modelRule, PR #5290)
 	isOpenCode := provider == "opencode" || provider == "opencode-go" || provider == "opencode-zen"
-	isDeepSeek := strings.Contains(modelLower, "deepseek") || isOpenCode
-	isKimi := strings.HasPrefix(modelLower, "kimi-")
+	if provider == "commandcode" {
+		scope = reasoningInjectAll
+	} else if strings.Contains(modelLower, "deepseek") || isOpenCode {
+		scope = reasoningInjectAll
+	} else if strings.HasPrefix(modelLower, "kimi-") {
+		scope = reasoningInjectToolCalls
+	}
 
-	if !isDeepSeek && !isKimi {
+	if scope == reasoningInjectNone {
 		return body
 	}
 
-	changed := normalizeTopLevelReasoning(reqMap)
+	changed := false
+	if provider == "deepseek" {
+		// The -max/-none catalog ids are 9router's own aliases, not wire ids;
+		// resolve them to the base model with their thinking toggle/effort
+		// attached so the injection below runs against the id the API serves.
+		changed = applyDeepSeekV4ProAlias(reqMap, modelLower)
+	}
+	changed = normalizeTopLevelReasoning(reqMap) || changed
 
 	for i, m := range msgs {
 		msgMap, ok := m.(map[string]any)
@@ -892,7 +992,7 @@ func InjectReasoningContent(body []byte, provider string) []byte {
 				changed = true
 			}
 
-			if isKimi {
+			if scope == reasoningInjectToolCalls {
 				toolCalls, hasTC := msgMap["tool_calls"].([]any)
 				if !hasTC || len(toolCalls) == 0 {
 					msgs[i] = msgMap
@@ -928,4 +1028,26 @@ func InjectReasoningContent(body []byte, provider string) []byte {
 		return body
 	}
 	return newBody
+}
+
+// stripAgentIsolationFromArgs removes "isolation" from the JSON arguments of an Agent tool call
+// in conversation history, breaking in-context repetition loops where a model mimics prior
+// worktree probe calls.
+func stripAgentIsolationFromArgs(raw string) string {
+	if !strings.Contains(raw, "isolation") {
+		return raw
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return raw
+	}
+	if _, has := m["isolation"]; !has {
+		return raw
+	}
+	delete(m, "isolation")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return string(out)
 }

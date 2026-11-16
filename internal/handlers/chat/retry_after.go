@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"9router/proxy/internal/constants"
+	"9router/proxy/internal/translator"
 )
 
 const (
@@ -48,6 +49,23 @@ const brief429RetryTolerance = 2 * time.Second
 // on a 429 names a quota window that waiting out here cannot shorten.
 const comboRetryWaitCap = 8 * time.Second
 
+// deepSeekWebMaxMuteCooldown is the ceiling for a DeepSeek web mute the site
+// announced. Its mute envelope names a real release time, and the generic 2h
+// cap would re-pick the muted account long before the mute ends — which is how
+// a brief mute becomes a longer one.
+const deepSeekWebMaxMuteCooldown = 7 * 24 * time.Hour
+
+// maxCooldownFor returns the ceiling for an announced wait on one provider.
+// Every provider shares maxResetCooldown; deepseek-web is the exception because
+// its enforcement payload carries the actual release time and clamping it
+// defeats the purpose of reporting it.
+func maxCooldownFor(provider string) time.Duration {
+	if provider == "deepseek-web" {
+		return deepSeekWebMaxMuteCooldown
+	}
+	return maxResetCooldown
+}
+
 // comboPassRetryWait returns how long to hold a fully-failed combo pass before
 // repeating it, or 0 when the pass must not be repeated.
 //
@@ -78,7 +96,7 @@ func comboPassRetryWait(earliest time.Duration, rateLimited bool) time.Duration 
 // account again instead of waiting out a lock it set itself. Every other
 // status keeps the quota-reset reading it has always had. maxResetCooldown
 // stops a hostile or nonsensical duration from parking an account forever.
-func retryableCooldownSec(statusCode int, base time.Duration, ue *upstreamError) int {
+func retryableCooldownSec(statusCode int, base time.Duration, ue *upstreamError, provider string) int {
 	cooldown := base
 	if statusCode == http.StatusTooManyRequests {
 		if wait, ok := retryAfterWait(ue); ok {
@@ -87,7 +105,7 @@ func retryableCooldownSec(statusCode int, base time.Duration, ue *upstreamError)
 	} else if dur, ok := extractResetDuration(ue.Body); ok {
 		cooldown = dur
 	}
-	return ceilSeconds(min(cooldown, maxResetCooldown))
+	return ceilSeconds(min(cooldown, maxCooldownFor(provider)))
 }
 
 // passRetry is the rate-limit bookkeeping for one combo pass. The OpenAI and
@@ -143,6 +161,21 @@ func (p *passRetry) writeError(cw *committedResponseWriter, lastErr *upstreamErr
 	// and code never reach it.
 	if cw.stream {
 		cw.Header().Set(constants.HeaderContentType, constants.ContentTypeEventStream)
+		if cw.responsesClient {
+			var errBody struct {
+				Error map[string]any `json:"error"`
+			}
+			if err := json.Unmarshal(lastErr.Body, &errBody); err == nil && errBody.Error != nil {
+				if code, _ := errBody.Error["code"].(string); code == "context_length_exceeded" {
+					cw.WriteHeader(http.StatusOK)
+					_, _ = cw.Write([]byte(translator.FormatResponsesFailedSSE(errBody.Error)))
+					if f, ok := cw.ResponseWriter.(http.Flusher); ok {
+						f.Flush()
+					}
+					return
+				}
+			}
+		}
 		cw.WriteHeader(lastErr.StatusCode)
 		frame := append([]byte("data: "), lastErr.Body...)
 		frame = append(frame, '\n', '\n')

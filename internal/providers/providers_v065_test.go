@@ -10,8 +10,8 @@ func TestClaudeFingerprint_21258(t *testing.T) {
 	if !ok {
 		t.Fatal("claude provider not found")
 	}
-	if got := cfg.StaticHeaders["User-Agent"]; got != "claude-cli/2.1.280 (external, sdk-cli)" {
-		t.Errorf("expected User-Agent claude-cli/2.1.280, got %q", got)
+	if got := cfg.StaticHeaders["User-Agent"]; got != "claude-cli/2.1.322 (external, sdk-cli)" {
+		t.Errorf("expected User-Agent claude-cli/2.1.322, got %q", got)
 	}
 	if got := cfg.StaticHeaders["Anthropic-Beta"]; !strings.Contains(got, "prompt-caching-scope-2026-01-05") || !strings.Contains(got, "claude-code-20250219") {
 		t.Errorf("Anthropic-Beta should contain full v0.5.65 beta list, got %q", got)
@@ -66,6 +66,28 @@ func TestMuseSpark_Capabilities(t *testing.T) {
 	caps := GetCapabilitiesForModel("", "muse-spark-2.0-free")
 	if !caps.Vision || !caps.Reasoning {
 		t.Errorf("pattern muse-spark should have Vision+Reasoning, got %+v", caps)
+	}
+}
+func TestMuseSparkContributor_MandatoryReasoning(t *testing.T) {
+	models := []struct{ provider, model string }{
+		{"cline", "muse-spark-1.2-contributor"},
+		{"cline", "muse-spark-1.3-contributor"},
+		{"cline", "cline-free/muse-spark-1.2-contributor"},
+		{"cline", "cline-free/muse-spark-1.3-contributor"},
+		{"opencode", "muse-spark-1.2-contributor-free"},
+		{"opencode", "muse-spark-1.3-contributor-free"},
+	}
+	for _, m := range models {
+		caps := GetCapabilitiesForModel(m.provider, m.model)
+		if !caps.Reasoning {
+			t.Errorf("%s: Reasoning=false, want true", m.model)
+		}
+		if caps.ThinkingFormat != "openai" {
+			t.Errorf("%s: ThinkingFormat=%q, want openai", m.model, caps.ThinkingFormat)
+		}
+		if caps.ThinkingCanDisable == nil || *caps.ThinkingCanDisable {
+			t.Errorf("%s: thinking must not be disableable (got %+v)", m.model, caps.ThinkingCanDisable)
+		}
 	}
 }
 

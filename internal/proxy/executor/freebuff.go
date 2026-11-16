@@ -3,6 +3,8 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -25,29 +27,51 @@ const (
 )
 
 var freebuffRootAgentByModel = map[string]string{
+	"deepseek/deepseek-v4-pro":        "base3-free-deepseek",
 	"deepseek/deepseek-v4-flash":      "base3-free-deepseek-flash",
+	"deepseek/deepseek-v4-flash-fast": "base3-fast",
+	"mimo/mimo-v2.5":                  "base3-free-mimo",
+	"mimo/mimo-v2.6-pro":              "base3-free-mimo-2-6-pro",
+	"minimax/minimax-m3":              "base3-free-minimax-m3",
+	"openai/gpt-5.6-luna":             "base3-free-luna",
+	"openai/gpt-6-luna":               "base3-free-luna-6",
+	"openai/gpt-6.1-sol":              "base3-free-gpt-6-1-sol",
+	"openai/gpt-6.1-terra":            "base3-free-gpt-6-1-terra",
+	"google/gemini-4-argon":           "base3-free-gemini-4-argon",
+	"google/gemini-3.8-flash":         "base3-free-gemini-3-8-flash",
 	"z-ai/glm-5.2":                    "base3-free-glm",
 	"z-ai/glm-5.3-flash":              "base3-free-glm-5-3-flash",
-	"mimo/mimo-v2.5":                  "base3-free-mimo",
-	"openai/gpt-5.6-luna":             "base3-free-luna",
 	"upstage/solar-pro4":              "base3-free-solar-pro4",
+	"upstage/solar-mini4":             "base3-free-solar-mini4",
 	"meta/muse-spark-1.2-contributor": "base3-free-muse-spark",
-	"anthropic/claude-fable-5":        "base3-free-fable",
+	"meta/muse-spark-1.3-contributor": "base3-free-muse-spark-1-3",
+	"anthropic/claude-fable-5":        "base2-free-fable",
+	"anthropic/claude-fable-5.1":      "base2-free-fable",
+	"space-bunny/space-bunny-alpha":   "base3-free-space-bunny-alpha",
+	"ox/ox-alpha":                     "base3-free-ox-alpha",
 }
 
 var freebuffRootOpenings = []string{
 	"You are Buffy, the strategic coding assistant.",
+	"You are Buffy, the coding agent behind Codebuff.",
 	"You are Buffy, the Freebuff Cloud project planner.",
+	"You are Buffy, the auto-run agent behind Freebuff Desktop.",
+	"You are Buffy, the project-understanding agent behind Freebuff.",
 	"You are Buffy, a strategic assistant that orchestrates complex coding tasks through specialized sub-agents.",
+}
+
+func generateFreebuffCliFingerprint() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return "codebuff-cli-" + base64.RawURLEncoding.EncodeToString(b)
 }
 
 func rootAgentIdForModel(model string) string {
 	if root, ok := freebuffRootAgentByModel[model]; ok {
 		return root
 	}
-	return "base2-free"
+	return "base3-free-deepseek-flash"
 }
-
 func freebuffOrigin(baseURL string) string {
 	if baseURL != "" {
 		if u, err := url.Parse(baseURL); err == nil && u.Scheme != "" && u.Host != "" {
@@ -55,31 +79,6 @@ func freebuffOrigin(baseURL string) string {
 		}
 	}
 	return "https://www.codebuff.com"
-}
-
-// applyRelayHeaders points a freebuff control-plane request at its real
-// destination through an edge relay.
-//
-// A relay connection rewrites BaseURL to the relay host, and the relay forwards
-// to x-relay-target + x-relay-path while ignoring the URL it was dialed at
-// (internal/handlers/media/deploy.go, netlify_relay.go). So the path has to be
-// the endpoint THIS call needs, not the one the connection stamped:
-// BuildEdgeRelayHeaders derives x-relay-path from the provider base URL, and for
-// freebuff the registry base URL is the chat route
-// (https://www.codebuff.com/api/v1/chat/completions) — copying it verbatim sent
-// every session/run/release call to the chat-completions endpoint.
-//
-// The origin is the provider host and is the same for all of these calls, so it
-// comes from StaticHeaders. Freebuff owns its CLI identity headers; nothing else
-// is copied. No x-relay-target means the connection is not relayed, so this is a
-// no-op and the call goes straight to the origin freebuffOrigin already built.
-func applyRelayHeaders(req *http.Request, headers map[string]string, path string) {
-	target := headers["x-relay-target"]
-	if target == "" {
-		return
-	}
-	req.Header.Set("x-relay-target", target)
-	req.Header.Set("x-relay-path", path)
 }
 
 func ensureFreebuffMarker(body map[string]any) {
@@ -161,7 +160,6 @@ func startFreebuffRun(ctx context.Context, client *http.Client, baseURL, token, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", freebuffCLIUserAgent)
-	applyRelayHeaders(req, headers, freebuffRunPath)
 
 	resp, err := DoFreebuffHTTP(ctx, client, req)
 	if err != nil {
@@ -211,7 +209,6 @@ func finishFreebuffRun(ctx context.Context, client *http.Client, baseURL, token,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", freebuffCLIUserAgent)
-	applyRelayHeaders(req, headers, freebuffRunPath)
 
 	resp, err := DoFreebuffHTTP(finishCtx, client, req)
 	if err == nil {
@@ -296,13 +293,15 @@ func ForwardFreebuff(w http.ResponseWriter, req *Request) error {
 		clientID, _ = req.ConnData["fingerprintId"].(string)
 	}
 	if clientID == "" {
-		clientID = uuid.New().String()
+		clientID = generateFreebuffCliFingerprint()
 	}
 	codebuffMeta := map[string]any{
-		"client_id":        clientID,
-		"cost_mode":        "free",
-		"run_id":           runID,
-		"trace_session_id": uuid.New().String(),
+		"client_id":              clientID,
+		"cost_mode":              "free",
+		"run_id":                 runID,
+		"trace_session_id":       uuid.New().String(),
+		"surface":                "cli",
+		"freebuff_multi_session": "1",
 	}
 	if sess != nil && sess.InstanceID != "" {
 		codebuffMeta["freebuff_instance_id"] = sess.InstanceID
@@ -323,6 +322,9 @@ func ForwardFreebuff(w http.ResponseWriter, req *Request) error {
 		if req.IsStream {
 			headers["Accept"] = "text/event-stream"
 		}
+		// Freebuff requires x-freebuff-sse-gzip-recovery: 1 for all chat completions.
+		// Without it, upstream returns 410 freebuff_update_required.
+		headers["x-freebuff-sse-gzip-recovery"] = "1"
 		for k, v := range req.Config.StaticHeaders {
 			headers[k] = v
 		}
@@ -431,7 +433,7 @@ func ForwardFreebuff(w http.ResponseWriter, req *Request) error {
 	runStatus = "completed"
 
 	if req.IsStream {
-		stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, 0, "freebuff")
+		stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, req.Config.ResolveStallTimeout(proxy.ResolveDefaultStallTimeout()), "freebuff")
 		defer stallReader.Close()
 		return execSSEStream(w, stallReader, req)
 	}

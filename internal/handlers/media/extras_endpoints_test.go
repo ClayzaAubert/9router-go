@@ -3,6 +3,7 @@ package media
 import (
 	"database/sql"
 	json "encoding/json/v2"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,6 +51,47 @@ func TestHandleSearch_Success(t *testing.T) {
 	}
 	if resp["results"] == nil {
 		t.Errorf("expected results in response, got %v", resp)
+	}
+}
+
+func TestHandleSearch_HonorsSearchURL(t *testing.T) {
+	var requestedPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"results":[{"title":"Result 1","url":"https://example.com/1"}]}`))
+	}))
+	defer upstream.Close()
+
+	origTavily := providers.KnownProviders["tavily"]
+	custom := origTavily
+	custom.BaseURL = upstream.URL + "/search"
+	custom.SearchURL = upstream.URL + "/search"
+	providers.KnownProviders["tavily"] = custom
+	defer func() {
+		providers.KnownProviders["tavily"] = origTavily
+	}()
+
+	database, cleanup := setupMultimodalTestDB(t)
+	defer cleanup()
+	seedFetchConn(t, database, "tavily", "conn-tavily", "tvly-test")
+
+	repo := db.NewRepo(database)
+	handler := newTestMediaHandler(repo)
+
+	body := `{"model":"tavily/search","query":"golang"}`
+	req := httptest.NewRequest("POST", "/v1/search", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.HandleSearch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if requestedPath != "/search" {
+		t.Errorf("expected request to /search, got %s", requestedPath)
 	}
 }
 
@@ -507,6 +549,95 @@ func TestHandleWebFetch_jinaReader(t *testing.T) {
 	}
 }
 
+func TestHandleWebFetch_Formats(t *testing.T) {
+	var lastHeader http.Header
+	var lastBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastHeader = r.Header.Clone()
+		lastBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"content":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	jr := providers.KnownProviders["jina-reader"]
+	origFetch := jr.FetchURL
+	origBase := jr.BaseURL
+	jr.FetchURL = upstream.URL
+	jr.BaseURL = upstream.URL
+	providers.KnownProviders["jina-reader"] = jr
+	defer func() {
+		jr.FetchURL = origFetch
+		jr.BaseURL = origBase
+		providers.KnownProviders["jina-reader"] = jr
+	}()
+
+	database, cleanup := setupMultimodalTestDB(t)
+	defer cleanup()
+	seedFetchConn(t, database, "jina-reader", "conn-jina", "sk-test")
+	seedFetchConn(t, database, "tavily", "conn-tavily", "sk-tavily")
+
+	tav := providers.KnownProviders["tavily"]
+	origTavFetch := tav.FetchURL
+	origTavBase := tav.BaseURL
+	tav.FetchURL = upstream.URL
+	tav.BaseURL = upstream.URL
+	providers.KnownProviders["tavily"] = tav
+	defer func() {
+		tav.FetchURL = origTavFetch
+		tav.BaseURL = origTavBase
+		providers.KnownProviders["tavily"] = tav
+	}()
+
+	repo := db.NewRepo(database)
+	handler := newTestMediaHandler(repo)
+
+	// Jina forwards html format via x-respond-with header
+	req := httptest.NewRequest("POST", "/v1/web/fetch", strings.NewReader(`{"model":"jina-reader/fetch","url":"https://example.com","format":"html"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.HandleWebFetch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("jina html status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := lastHeader.Get("x-respond-with"); got != "html" {
+		t.Errorf("jina x-respond-with = %q, want html", got)
+	}
+
+	// Jina rejects unsupported format
+	req = httptest.NewRequest("POST", "/v1/web/fetch", strings.NewReader(`{"model":"jina-reader/fetch","url":"https://example.com","format":"pdf"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	handler.HandleWebFetch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("jina pdf status = %d, want 400", rec.Code)
+	}
+
+	// Tavily forwards format in body
+	req = httptest.NewRequest("POST", "/v1/web/fetch", strings.NewReader(`{"model":"tavily/extract","url":"https://example.com","format":"text"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	handler.HandleWebFetch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tavily text status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var tavBody map[string]any
+	_ = json.Unmarshal(lastBody, &tavBody)
+	if tavBody["format"] != "text" {
+		t.Errorf("tavily body format = %v, want text", tavBody["format"])
+	}
+
+	// Tavily rejects html
+	req = httptest.NewRequest("POST", "/v1/web/fetch", strings.NewReader(`{"model":"tavily/extract","url":"https://example.com","format":"html"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	handler.HandleWebFetch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("tavily html status = %d, want 400", rec.Code)
+	}
+}
+
 func TestHandleWebFetch_firecrawl(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -543,6 +674,88 @@ func TestHandleWebFetch_firecrawl(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSearch_Keenable(t *testing.T) {
+	var receivedBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"results":[{"title":"Keenable result","url":"https://example.com/1"}]}`))
+	}))
+	defer upstream.Close()
+
+	origKeenable := providers.KnownProviders["keenable"]
+	custom := origKeenable
+	custom.SearchURL = upstream.URL + "/search"
+	providers.KnownProviders["keenable"] = custom
+	defer func() {
+		providers.KnownProviders["keenable"] = origKeenable
+	}()
+
+	database, cleanup := setupMultimodalTestDB(t)
+	defer cleanup()
+	seedFetchConn(t, database, "keenable", "conn-keenable", "public")
+
+	repo := db.NewRepo(database)
+	handler := newTestMediaHandler(repo)
+
+	body := `{"model":"keenable/search","query":"golang release","max_results":5}`
+	req := httptest.NewRequest("POST", "/v1/search", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.HandleSearch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if receivedBody != `{"query":"golang release"}` {
+		t.Errorf("expected body stripped to query only, got %q", receivedBody)
+	}
+}
+
+func TestHandleWebFetch_Keenable(t *testing.T) {
+	var receivedURL string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedURL = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"title":"Keenable fetch","content":"fetched content"}`))
+	}))
+	defer upstream.Close()
+
+	origKeenable := providers.KnownProviders["keenable"]
+	custom := origKeenable
+	custom.FetchURL = upstream.URL + "/fetch"
+	custom.FetchMethod = http.MethodGet
+	providers.KnownProviders["keenable"] = custom
+	defer func() {
+		providers.KnownProviders["keenable"] = origKeenable
+	}()
+
+	database, cleanup := setupMultimodalTestDB(t)
+	defer cleanup()
+	seedFetchConn(t, database, "keenable", "conn-keenable-fetch", "public")
+
+	repo := db.NewRepo(database)
+	handler := newTestMediaHandler(repo)
+
+	body := `{"model":"keenable/fetch","url":"https://example.com/page","format":"markdown"}`
+	req := httptest.NewRequest("POST", "/v1/web/fetch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.HandleWebFetch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(receivedURL, "url=https%3A%2F%2Fexample.com%2Fpage") || !strings.Contains(receivedURL, "format=markdown") {
+		t.Errorf("expected url+format query, got %q", receivedURL)
 	}
 }
 

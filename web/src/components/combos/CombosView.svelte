@@ -7,8 +7,11 @@
     getComboModels,
     INHERIT_STRATEGY,
     parseCapacityAdapterSettings,
-    resolveComboStrategy,
     updateComboStrategy,
+    updateComboBudgetCalls,
+    updateComboBudgetWindow,
+    updateFirstTokenGrace,
+    updateFirstTokenTimeout,
     updateJudgeModel,
     updateRouterModel,
     updateSmartPolicy,
@@ -90,6 +93,70 @@
   // "deepseek-v4.1-flash" find the right rows.
   let searchQuery = $state('')
   let normalizedQuery = $derived(searchQuery.trim().toLowerCase())
+  let testingCombos = $state<Record<string, boolean>>({})
+  let comboTestResults = $state<
+    Record<
+      string,
+      {
+        results?: Record<string, { ok: boolean; latencyMs: number; error?: string }>
+        summary?: { total: number; alive: number; dead: number }
+        activeModel?: string | null
+      }
+    >
+  >({})
+
+  async function handleTestCombo(combo: Combo) {
+    if (!combo?.id || testingCombos[combo.id]) return
+    const models = getComboModels(combo)
+    if (models.length === 0) return
+
+    testingCombos[combo.id] = true
+    const currentResults: Record<string, { ok: boolean; latencyMs: number; error?: string }> = {}
+
+    try {
+      for (const model of models) {
+        comboTestResults[combo.id] = {
+          ...comboTestResults[combo.id],
+          activeModel: model,
+        }
+
+        try {
+          const res = await api.testComboModels(combo.id, { models: [model], kind: combo.kind || 'llm' })
+          if (res?.results?.[0]) {
+            currentResults[model] = res.results[0]
+          } else {
+            currentResults[model] = {
+              ok: false,
+              latencyMs: 0,
+              error: 'Failed',
+            }
+          }
+        } catch (err) {
+          currentResults[model] = {
+            ok: false,
+            latencyMs: 0,
+            error: err instanceof Error ? err.message : String(err),
+          }
+        }
+
+        const alive = Object.values(currentResults).filter((r) => r.ok).length
+        const totalTested = Object.values(currentResults).length
+        comboTestResults[combo.id] = {
+          results: { ...currentResults },
+          summary: {
+            total: models.length,
+            alive,
+            dead: totalTested - alive,
+          },
+        }
+      }
+    } finally {
+      testingCombos[combo.id] = false
+      if (comboTestResults[combo.id]) {
+        comboTestResults[combo.id].activeModel = null
+      }
+    }
+  }
   let filteredCombos = $derived(
     normalizedQuery
       ? llmCombos.filter(
@@ -181,6 +248,64 @@
       console.error('Failed to update combo strategy:', e)
     }
   }
+  // Respect stored order lives beside the strategy dropdown because it
+  // modifies how that strategy behaves: the rotation is skipped and the
+  // stored list is walked as-is. The capability reorder still runs, so a
+  // request that needs vision floats a capable model to the front.
+  async function handleToggleStoredOrder(combo: Combo, respect: boolean) {
+    const updated = { ...comboStrategies }
+    updated[combo.name] = { ...(updated[combo.name] || {}), respectStoredOrder: respect }
+    comboStrategies = updated
+    try {
+      await api.patchSettings({ comboStrategies: updated })
+      onRefresh()
+    } catch (e) {
+      console.error('Failed to update stored-order flag:', e)
+    }
+  }
+
+  async function handleSetResponseTimeout(combo: Combo, timeoutMs: number) {
+    const previous = comboStrategies
+    const updated = updateFirstTokenTimeout(comboStrategies, combo.name, timeoutMs)
+    if (updated === previous) return
+    comboStrategies = updated
+    try {
+      await api.patchSettings({ comboStrategies: updated })
+    } catch (e) {
+      if (comboStrategies === updated) comboStrategies = previous
+      console.error('Failed to update model response timeout:', e)
+    }
+  }
+  // The budget ceiling sits beside the strategy for the same reason the
+  // stored-order flag does: it decides how long the combo keeps serving.
+  async function handleSetBudgetCalls(combo: Combo, budgetCalls: number) {
+    const previous = comboStrategies
+    const updated = updateComboBudgetCalls(comboStrategies, combo.name, budgetCalls)
+    if (updated === previous) return
+    comboStrategies = updated
+    try {
+      await api.patchSettings({ comboStrategies: updated })
+      onRefresh()
+    } catch (e) {
+      if (comboStrategies === updated) comboStrategies = previous
+      console.error('Failed to update combo budget:', e)
+    }
+  }
+  // The window rides along with the ceiling: setting a ceiling without a
+  // window leaves the backend default, so the two are edited in one place.
+  async function handleSetBudgetWindow(combo: Combo, windowMs: number) {
+    const previous = comboStrategies
+    const updated = updateComboBudgetWindow(comboStrategies, combo.name, windowMs)
+    if (updated === previous) return
+    comboStrategies = updated
+    try {
+      await api.patchSettings({ comboStrategies: updated })
+      onRefresh()
+    } catch (e) {
+      if (comboStrategies === updated) comboStrategies = previous
+      console.error('Failed to update combo budget window:', e)
+    }
+  }
 
   async function handleSetJudge(comboName: string, judgeModel: string) {
     const updated = updateJudgeModel(comboStrategies, comboName, judgeModel)
@@ -252,14 +377,34 @@
     comboSaveError = ''
   }
 
-  async function handleSaveCombo(name: string, models: string[], matchRules: SmartRule[]) {
+  async function handleSaveCombo(
+    name: string,
+    models: string[],
+    matchRules: SmartRule[],
+    timeoutMs: number,
+    graceMs: number | undefined,
+    customPrompt: string
+  ) {
     isSavingCombo = true
     comboSaveError = ''
     try {
       if (editingCombo) {
-        await api.updateCombo(editingCombo.id, { name, models, matchRules })
+        await api.updateCombo(editingCombo.id, { name, models, matchRules, customPrompt })
       } else {
-        await api.createCombo({ name, models, strategy: 'fallback', matchRules })
+        await api.createCombo({ name, models, strategy: 'fallback', matchRules, customPrompt })
+      }
+      // Strategies are keyed by combo name, so the timeout and grace are
+      // written under the saved name, in one patch, and only when they differ
+      // from what is stored: a plain save must not create an empty strategy row.
+      const stored = comboStrategies[name]
+      if ((stored?.firstTokenTimeoutMs ?? 0) !== timeoutMs || stored?.firstTokenGraceMs !== graceMs) {
+        const updated = updateFirstTokenGrace(
+          updateFirstTokenTimeout(comboStrategies, name, timeoutMs),
+          name,
+          graceMs
+        )
+        await api.patchSettings({ comboStrategies: updated })
+        comboStrategies = updated
       }
       closeModal()
       onRefresh()
@@ -433,7 +578,7 @@
           type="button"
           onclick={() => (searchQuery = '')}
           aria-label="Clear search"
-          class="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted transition-colors hover:text-text-main"
+          class="absolute right-2 top-1/2 -translate-y-1/2 rounded p-2.5 sm:p-1 text-text-muted transition-colors hover:text-text-main"
         >
           <X class="h-4 w-4" />
         </button>
@@ -546,6 +691,10 @@
             globalStrategy={globalComboStrategy}
             {copiedId}
             onSetStrategy={handleSetStrategy}
+            onSetResponseTimeout={handleSetResponseTimeout}
+            onToggleStoredOrder={handleToggleStoredOrder}
+            onSetBudgetCalls={handleSetBudgetCalls}
+            onSetBudgetWindow={handleSetBudgetWindow}
             onOpenJudgePicker={(c) => { editingCombo = c; openModelPicker('judge') }}
             onClearJudge={clearJudge}
             onOpenRouterPicker={(c) => { editingCombo = c; openModelPicker('router') }}
@@ -553,6 +702,9 @@
             onCopy={copyName}
             onEdit={openEditModal}
             onDelete={(c) => (confirmState = { name: c.name, ids: [c.id] })}
+            onTest={handleTestCombo}
+            isTesting={!!testingCombos[combo.id]}
+            testData={comboTestResults[combo.id]}
             isSelected={selectedIds.has(combo.id)}
             onToggleSelect={toggleSelect}
           />
@@ -577,6 +729,8 @@
     models={modalModels}
     isSaving={isSavingCombo}
     saveError={comboSaveError}
+    responseTimeoutMs={editingCombo ? comboStrategies[editingCombo.name]?.firstTokenTimeoutMs ?? 0 : 0}
+    responseGraceMs={editingCombo ? comboStrategies[editingCombo.name]?.firstTokenGraceMs : undefined}
     onClose={closeModal}
     onSave={handleSaveCombo}
     onOpenModelPicker={() => openModelPicker('combo')}

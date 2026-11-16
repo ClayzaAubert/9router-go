@@ -3,6 +3,8 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -15,6 +17,29 @@ import (
 	"9router/proxy/internal/providers"
 	"9router/proxy/internal/proxy"
 )
+
+// deepSeekFirstMessageFingerprint is the stable identity of a conversation
+// that sent no client session id: the account plus the conversation's first
+// user message. The system prompt never stands in for it — most clients lead
+// every conversation with the same system message, and keying on that would
+// put all of a client's conversations on one fallback key where each
+// divergent turn evicts the other's chain, leaving every turn a fresh session
+// carrying the full transcript. Identical first user messages still collide,
+// which is why the session store pairs this with an idle TTL and a tail check
+// that opens a fresh session the moment the prompts diverge.
+func deepSeekFirstMessageFingerprint(messages []deepSeekMessage) string {
+	for _, message := range messages {
+		if message.Role != "user" {
+			continue
+		}
+		h := sha256.New()
+		h.Write([]byte(message.Role))
+		h.Write([]byte{0})
+		h.Write([]byte(message.Content))
+		return hex.EncodeToString(h.Sum(nil))[:16]
+	}
+	return ""
+}
 
 // ForwardDeepSeekWeb routes a chat completion through chat.deepseek.com's web
 // API using a browser-login credential — the port of OmniRoute's
@@ -81,7 +106,7 @@ func ForwardDeepSeekWeb(w http.ResponseWriter, req *Request) error {
 		return deepSeekAuthFailure(err, userToken)
 	}
 
-	session, err := deepSeekAcquireSession(ctx, turn, accessToken, stealth, userToken, req, prompt)
+	session, err := deepSeekAcquireSession(ctx, turn, accessToken, stealth, userToken, deepSeekFirstMessageFingerprint(envelope.Messages), req, prompt)
 	if err != nil {
 		return deepSeekAuthFailure(err, userToken)
 	}
@@ -101,6 +126,40 @@ func ForwardDeepSeekWeb(w http.ResponseWriter, req *Request) error {
 		// draining the stream, not by asking the upstream not to send one.
 		Stream: true,
 	})
+	if err != nil && session.claim.reuse && ctx.Err() == nil && !isDeepSeekAuthError(err) {
+		// The pinned session failed at the HTTP level: the chat was deleted in
+		// the DeepSeek UI, the upstream session expired, or the connection
+		// dropped. None of that is the account being refused — the sibling
+		// implementation heals the same situation in-request by dropping the
+		// stale session and retrying once on a fresh one, and so does this:
+		// the fresh session carries the whole prompt, because nothing of the
+		// old thread can be assumed to exist. One retry only — a second
+		// failure is an upstream condition no third attempt of the same shape
+		// fixes, and every attempt is another request on this account. An
+		// auth failure never heals: the token was freshly exchanged and the
+		// upstream rejected it, so a new session would just add two more
+		// doomed calls to the account the site is refusing.
+		deepSeekAbandonSession(session, ctx, turn, userToken, accessToken)
+		deepSeekCloseSession(ctx, turn, userToken, accessToken, session.id)
+		if freshID, createErr := turn.createSession(ctx, accessToken); createErr == nil {
+			retry, retryErr := turn.completion(ctx, accessToken, deepSeekCompletionRequest{
+				ChatSessionID:   freshID,
+				ParentMessageID: nil,
+				ModelType:       options.modelType,
+				Prompt:          prompt,
+				RefFileIDs:      []string{},
+				ThinkingEnabled: options.thinking,
+				SearchEnabled:   options.search,
+				Stream:          true,
+			})
+			if retryErr == nil {
+				response, err = retry, nil
+				session.id = freshID
+				session.createdHere = true
+				session.claim = deepSeekSessionClaim{tail: prompt, pin: true}
+			}
+		}
+	}
 	if err != nil {
 		deepSeekAbandonSession(session, ctx, turn, userToken, accessToken)
 		return deepSeekAuthFailure(err, userToken)
@@ -126,9 +185,55 @@ func ForwardDeepSeekWeb(w http.ResponseWriter, req *Request) error {
 	// session, same completion. The branch exists below the shared preamble so
 	// that a request without tools cannot be affected by any of it.
 	var runErr error
+	var settled *deepSeekStreamAccumulator
 	switch {
 	case len(envelope.Tools) > 0:
-		runErr = deepSeekToolTurnToClient(w, req, response.Body, envelope, accumulator)
+		// One nonce per request, minted once: the prompt carries it and the
+		// parser compares against it, so a second mint would reject every call
+		// the prompt asked for.
+		nonce := deepSeekToolNonce(envelope.Tools)
+		settled, runErr = deepSeekToolTurnToClient(w, req, response.Body, envelope, accumulator, nonce,
+			func(repairPrompt string) (*deepSeekStreamAccumulator, error) {
+				// The session the malformed envelope arrived on is not one the
+				// next turn can continue: its transcript ends in a rejected
+				// answer. The repair runs on a fresh upstream session carrying
+				// the whole prompt again, and that session is the one this turn
+				// settles.
+				deepSeekAbandonSession(session, ctx, turn, userToken, accessToken)
+				deepSeekCloseSession(ctx, turn, userToken, accessToken, session.id)
+				freshID, err := turn.createSession(ctx, accessToken)
+				if err != nil {
+					return nil, err
+				}
+				retry, err := turn.completion(ctx, accessToken, deepSeekCompletionRequest{
+					ChatSessionID:   freshID,
+					ParentMessageID: nil,
+					ModelType:       options.modelType,
+					Prompt:          repairPrompt,
+					RefFileIDs:      []string{},
+					ThinkingEnabled: options.thinking,
+					SearchEnabled:   options.search,
+					Stream:          true,
+				})
+				if err != nil {
+					return nil, err
+				}
+				// The body is drained and closed here, inside the scope that
+				// opened it: the tool path buffers the whole answer anyway, so
+				// there is nothing left to stream once the read returns. The
+				// close error after a complete read carries nothing the client
+				// could act on.
+				repaired := newDeepSeekStreamAccumulator(envelope.Model)
+				if err := deepSeekDrain(retry.Body, repaired); err != nil {
+					_ = retry.Body.Close()
+					return nil, err
+				}
+				_ = retry.Body.Close()
+				session.id = freshID
+				session.createdHere = true
+				session.claim = deepSeekSessionClaim{tail: repairPrompt, pin: true}
+				return repaired, nil
+			})
 	default:
 		forwardUpstreamResponseHeaders(w, response.Header)
 		if req.IsStream {
@@ -136,6 +241,9 @@ func ForwardDeepSeekWeb(w http.ResponseWriter, req *Request) error {
 		} else {
 			runErr = deepSeekCollectToClient(w, req, response.Body, envelope.Model, accumulator)
 		}
+	}
+	if settled != nil {
+		accumulator = settled
 	}
 
 	if !deepSeekSettleSession(session, prompt, accumulator, runErr, ctx, turn, accessToken) {
@@ -200,13 +308,14 @@ func deepSeekAcquireSession(
 	accessToken string,
 	stealth deepSeekStealth,
 	userToken string,
+	firstMessageFingerprint string,
 	req *Request,
 	prompt string,
 ) (deepSeekSession, error) {
 	session := deepSeekSession{claim: deepSeekSessionClaim{tail: prompt}}
 
 	if stealth.persistSession {
-		session.key = deepSeekSessionKey(userToken, req.SessionID)
+		session.key = deepSeekSessionKey(userToken, req.SessionID, firstMessageFingerprint)
 		session.claim = deepSeekSessions.claim(session.key, prompt)
 	}
 
@@ -298,6 +407,14 @@ func deepSeekHistoryWindow(connData map[string]any) int {
 	return 0
 }
 
+// deepSeekFinishedDrain is how long the upstream is given, after it has said
+// FINISHED, to send the last of its answer. DeepSeek sometimes holds the
+// completion body open past FINISHED — most often while the search_results
+// event is still coming — and a reader that waits for that close hangs the
+// client on a stream that has already said everything. Upstream's
+// done-terminator waits the same 750ms and then closes the body itself.
+const deepSeekFinishedDrain = 750 * time.Millisecond
+
 // deepSeekStreamToClient relays the upstream event stream as OpenAI chunks.
 //
 // The stream is only complete when the upstream says so. A body that closes
@@ -328,9 +445,7 @@ func deepSeekStreamToClient(w http.ResponseWriter, req *Request, upstream io.Rea
 		if emitErr != nil {
 			return emitErr
 		}
-		if req.TTFT != nil && *req.TTFT == 0 {
-			*req.TTFT = time.Since(startTime).Milliseconds()
-		}
+		markTTFT(req, startTime)
 		chunk := map[string]any{
 			"id":      responseID,
 			"object":  "chat.completion.chunk",
@@ -356,8 +471,21 @@ func deepSeekStreamToClient(w http.ResponseWriter, req *Request, upstream io.Rea
 	// Reasoning and visible text are separate channels on the wire. The role
 	// delta rides whichever channel opens first, and each channel is emitted as
 	// a delta from what the client has already been sent.
+	//
+	// DeepSeek's web models reach for their native DSML tool syntax even when
+	// the request declared no tools, and that markup is not an answer. The
+	// scrubber drops it as it arrives, so the client sees the prose around it
+	// and never the tags.
+	var scrubber deepSeekDSMLScrubber
 	thinkingSent, contentSent, roleAnnounced := 0, 0, false
-	scanErr := proxy.ScanStream(upstream, func(payload []byte) {
+	// The stream is not over when the upstream says FINISHED: search results
+	// can still follow it. The scan is bounded past that point instead of
+	// waiting for the body to close, matching upstream's done-terminator —
+	// 750ms after FINISHED the reader is closed and the turn is answered,
+	// so a client never hangs on a body the site left open.
+	scanErr := proxy.ScanStreamWithDeadline(req.Ctx, upstream, deepSeekFinishedDrain, func() bool {
+		return accumulator.sawFinished
+	}, func(payload []byte) {
 		if emitErr != nil {
 			return
 		}
@@ -377,9 +505,11 @@ func deepSeekStreamToClient(w http.ResponseWriter, req *Request, upstream io.Rea
 			}
 			_ = emit(delta, nil)
 		}
-		if content, sent := deepSeekDeltaFrom(accumulator.contentText(), contentSent); content != "" {
-			contentSent = sent
-			delta := map[string]any{"content": content}
+		contentTail := accumulator.contentText()[contentSent:]
+		clean, consumed := scrubber.scrub(contentTail)
+		contentSent += consumed
+		if clean != "" {
+			delta := map[string]any{"content": clean}
 			if !roleAnnounced {
 				roleAnnounced = true
 				delta["role"] = "assistant"
@@ -451,7 +581,11 @@ func deepSeekCollectToClient(w http.ResponseWriter, req *Request, upstream io.Re
 			"deepseek-web: stream ended before completion — the upstream session was cut off")
 	}
 
-	message := map[string]any{"role": "assistant", "content": accumulator.contentText()}
+	text := accumulator.contentText()
+	if deepSeekHasDSML(text) {
+		text = deepSeekStripDSML(text)
+	}
+	message := map[string]any{"role": "assistant", "content": text}
 	if thinking := accumulator.thinkingText(); thinking != "" {
 		message["reasoning_content"] = thinking
 	}

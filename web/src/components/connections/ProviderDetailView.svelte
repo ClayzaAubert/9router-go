@@ -13,6 +13,7 @@
     type Settings
   } from '../../api/client'
   import { PROVIDER_CATALOG, PROVIDER_CATALOG_MAP, type ProviderCatalogItem } from '../../lib/providers'
+  import ClaudeCacheTtl from '../quota/ClaudeCacheTtl.svelte'
   import {
     clearCallback,
     CODEX_REDIRECT_URI,
@@ -30,6 +31,7 @@
   import { getModelsByProviderId, PROVIDER_ID_TO_ALIAS } from '../../lib/models'
   import { copyToClipboard } from '../../lib/clipboard'
   import { parseModelIds } from '../../lib/bulk-models'
+  import { inferModelKind, customModelKeyFor } from '../../lib/modelKindInference'
   import {
     importCustomModelsBestEffort,
     notifyCustomModelsChanged,
@@ -47,10 +49,12 @@
     fetchSuggestedModels,
     getIconPath,
     isChatModel,
+    isConnectionError,
     type CustomModelData,
     type ModelItem,
     type SuggestedModel
   } from './types'
+  import { isBannedConnection, appealUrl } from '../../lib/ban'
   import { proxyBadgeInfo } from './proxyBadge'
   import {
     formatCheckAllSummary,
@@ -85,9 +89,16 @@
   import { nodeLimitsDraftOf, nodeLimitsSummary, nodeLimitsUsageSummary } from '../../lib/node-limits'
   import type { ProviderNodeLimitsPatch } from '../../api/client'
   import Badge from '../../lib/ui/Badge.svelte'
+  import Toggle from '../../lib/ui/Toggle.svelte'
+  import { PauseCircle } from 'lucide-svelte'
   import ProviderHeaderOverridesModal from './ProviderHeaderOverridesModal.svelte'
+  import FreePiConnectModal from './FreePiConnectModal.svelte'
+  import FreePiAdBanner from './FreePiAdBanner.svelte'
   import EditCompatibleNodeModal from './EditCompatibleNodeModal.svelte'
+  import ExportKeysModal from './ExportKeysModal.svelte'
+  import ShareProviderModal from './ShareProviderModal.svelte'
   import FreebuffSessionBanner from './FreebuffSessionBanner.svelte'
+  import FreebuffAdBanner from './FreebuffAdBanner.svelte'
   import ProviderIcon from './ProviderIcon.svelte'
 
   interface Props {
@@ -161,14 +172,67 @@
     providerId === 'github' || providerId === 'kiro' || providerId === 'kimi' ||
     providerId === 'kimi-coding' || providerId === 'codebuddy-cn' || providerId === 'codebuddy-intl' ||
     providerId === 'minimax-code' || providerId === 'minimax-code-global' || providerId === 'muse' ||
-    providerId === 'nous' || providerId === 'glm'
+    providerId === 'nous' || providerId === 'glm' ||
+    providerId === 'zcode'
   )
   // Upstream parity: only the explicit noAuth flag hides the Connections card
   // ([id]/page.js isFreeNoAuth = !!FREE_PROVIDERS[id]?.noAuth). Category "free"
   // is NOT equivalent — kiro/gemini-cli are free with noAuth:false and still
   // need their Connect/OAuth + API Key buttons.
   let isNoAuth = $derived(selectedCatalogItem?.noAuth === true)
-  let hasRiskNotice = $derived(providerId === 'antigravity' || Boolean(selectedCatalogItem?.notice?.text?.includes('RISK_NOTICE')))
+
+  // Filtered connections for this provider, sorted by priority ASC
+  let providerConnections = $derived(
+    connections
+      .filter((c) => c.provider === providerId)
+      .sort((a, b) => (a.priority ?? 999999) - (b.priority ?? 999999))
+  )
+  let isProviderAllDisabled = $derived(
+    providerConnections.length > 0 && providerConnections.every((c) => c.isActive === 0)
+  )
+  let isProviderActive = $derived(providerConnections.some((c) => c.isActive === 1))
+
+  // Connection tab partition: every connection appears in exactly one tab.
+  let connTab = $state<'active' | 'error' | 'banned'>('active')
+  let bannedConnections = $derived(providerConnections.filter(isBannedConnection))
+  let errorConnections = $derived(
+    providerConnections.filter((c) => !isBannedConnection(c) && isConnectionError(c))
+  )
+  let activeConnections = $derived(
+    providerConnections.filter((c) => !isBannedConnection(c) && !isConnectionError(c))
+  )
+  let tabConnections = $derived(
+    connTab === 'banned'
+      ? bannedConnections
+      : connTab === 'error'
+        ? errorConnections
+        : activeConnections
+  )
+  let tabCounts = $derived({
+    active: activeConnections.length,
+    error: errorConnections.length,
+    banned: bannedConnections.length,
+  })
+  function tabMatches(c: ProviderConnection): boolean {
+    if (connTab === 'banned') return isBannedConnection(c)
+    if (connTab === 'error') return !isBannedConnection(c) && isConnectionError(c)
+    return !isBannedConnection(c) && !isConnectionError(c)
+  }
+
+  // Risk notice is driven by the connection's auth type (OAuth / subscription
+  // providers) and the upstream registry notice text — never by a hardcoded
+  // provider id such as `antigravity`.
+  let hasRiskNotice = $derived(
+    providerConnections.some((c) => c.authType === 'oauth') ||
+    Boolean(selectedCatalogItem?.notice?.text?.includes('RISK_NOTICE'))
+  )
+
+  // MiniMax Code lease auth: the connection borrows the desktop app's sign-in
+  // over its local broker, so there is no browser login and no stored refresh
+  // token. Only the two MiniMax Code lanes have that broker.
+  let isLeaseProvider = $derived(providerId === 'minimax-code' || providerId === 'minimax-code-global')
+  let isLeaseConnecting = $state(false)
+  let leaseError = $state('')
 
   // Free provider proxy & rotation state
   let freeProxyPoolId = $state('none')
@@ -197,12 +261,20 @@
     selectedNode?.id || selectedCatalogItem?.alias || PROVIDER_ID_TO_ALIAS[providerId] || providerId
   )
 
-  // Filtered connections for this provider, sorted by priority ASC
-  let providerConnections = $derived(
-    connections
-      .filter((c) => c.provider === providerId)
-      .sort((a, b) => (a.priority ?? 999999) - (b.priority ?? 999999))
-  )
+  function openAppeal(url: string) {
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }
+
+  async function handleToggleProvider(targetActive: boolean) {
+    try {
+      await Promise.allSettled(
+        providerConnections.map((c) => api.updateConnection(c.id, { isActive: targetActive ? 1 : 0 }))
+      )
+      onRefresh()
+    } catch (err) {
+      alert(`Toggle provider failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
   // Upstream parity: compatible-node detection drives the details card,
   // bottom Add button, models section, and edit-node modal.
   let isOpenAICompatibleNode = $derived(!!selectedNode && selectedNode.type === 'openai-compatible')
@@ -232,11 +304,22 @@
   // filter change; it is cleared on provider switch with the rest of the
   // model state (see the reset block below).
   let compatibleRows = $derived.by(() => {
-    const rows: Array<{ id: string; source: 'custom' | 'legacyAlias'; alias?: string; addedAt?: number }> = []
+    const rows: Array<{
+      id: string
+      source: 'custom' | 'legacyAlias'
+      alias?: string
+      addedAt?: number
+      kind?: string
+    }> = []
     const seen = new Set<string>()
     for (const cm of customModels) {
       if (!cm.id || cm.providerAlias !== storageAlias) continue
-      if ((cm.type || 'llm') !== 'llm') continue
+      // Every custom row on this node is listed, whatever its kind. This list is
+      // the only place a compatible node's custom models can be seen, tested or
+      // deleted, so filtering out the non-LLM ones made an imported TTS or video
+      // model unreachable: correctly absent from /v1/models, and equally absent
+      // from the one screen that could remove it. The row carries its kind so
+      // delete addresses the right key.
       const full = `${storageAlias}/${cm.id}`
       if (seen.has(full)) continue
       seen.add(full)
@@ -245,7 +328,12 @@
       // insertion order, and the newest write is last. A later row with the
       // same key keeps its original position (the upsert does not move it),
       // which is what "when was this first registered" means.
-      rows.push({ id: cm.id, source: 'custom', addedAt: customModels.length - customModels.indexOf(cm) })
+      rows.push({
+        id: cm.id,
+        source: 'custom',
+        addedAt: customModels.length - customModels.indexOf(cm),
+        kind: cm.type || 'llm',
+      })
     }
     const prefix = `${storageAlias}/`
     for (const [alias, full] of Object.entries(modelAliases || {})) {
@@ -316,7 +404,12 @@
         },
         thinkingLevels: caps?.thinkingLevels ?? [],
         deprecated: deprecationFor(providerId, r.id) !== null,
-        disabled: false,
+        // The disabledModels KV scope is keyed by the node's storage alias,
+        // which for a compatible node is the node id — the same key the
+        // registered branch uses. The gate itself already hides these rows
+        // from /v1/models (see models_list.go appendConnectionModels); this
+        // flag is what makes them selectable and filterable in the UI.
+        disabled: disabledModelIds.includes(r.id),
         testStatus: compatibleTestResults[r.id],
         latencyMs: compatibleTestLatency[r.id],
         addedAt: r.addedAt,
@@ -324,9 +417,10 @@
     })
   )
 
-  // The list the toolbar filters and the grid renders. Registered providers
-  // include disabled rows so the "Disabled" chip has something to select;
-  // compatible nodes have no disabled concept, so their list is all rows.
+  // The list the toolbar filters and both grids render. Registered providers
+  // and compatible nodes now share the same rule: the full row set is
+  // filtered, and a disabled row stays visible only while the operator is
+  // asking to see disabled or unavailable ones.
   let toolbarRows = $derived<ModelRowView[]>(isCompatibleNode ? compatibleRowViews : registeredRows)
   let filteredRows = $derived(applyModelListFilter(toolbarRows, modelListFilter))
   // The grid iterates in the toolbar's order — a Set would silently fall
@@ -684,7 +778,31 @@
   let addConnectionError = $state('')
   let showAddCustomModelModal = $state(false)
   let showEditNodeModal = $state(false)
+  let showExportKeysModal = $state(false)
+  let showShareProviderModal = $state(false)
+  // Everything the Share modal can offer in a multi-provider set: the custom
+  // nodes (which carry their own endpoint) plus the registered providers this
+  // instance actually holds a connection for. A provider with no credential is
+  // not shareable — the receiver would get a row that cannot answer.
+  let shareableProviders = $derived.by(() => {
+    const withConnections = new Set(providerConnections.filter((c) => c.isActive !== 0).map((c) => c.provider))
+    const out: Array<{ id: string; name: string; isCompatible: boolean }> = []
+    for (const n of providerNodes) out.push({ id: n.id, name: n.name || n.id, isCompatible: true })
+    for (const item of PROVIDER_CATALOG) {
+      if (withConnections.has(item.id) || withConnections.has(item.alias || '')) {
+        out.push({ id: item.id, name: item.name || item.id, isCompatible: false })
+      }
+    }
+    return out
+  })
   let showHeaderOverrides = $state(false)
+  let showFreePiConnect = $state(false)
+  let isFreePi = $derived(providerId === 'free-pi' || storageAlias === 'fp' || storageAlias === 'free-pi')
+  let freePiConn = $derived(
+    providerConnections.find((c) => c.isActive === 1) ?? providerConnections[0] ?? null
+  )
+  let freePiResetBusy = $state(false)
+  let freePiResetResult = $state<string>('')
   // Freebuff specific state & session tracking
   let isFreebuff = $derived(
     providerId === 'freebuff' || storageAlias === 'fb' || storageAlias === 'freebuff'
@@ -1437,6 +1555,31 @@
     onRefresh()
   }
 
+  // MiniMax Code lease: probe the desktop broker, then create a connection
+  // that borrows its sign-in. The broker's own code is shown verbatim, so an
+  // operator is told to sign in to the desktop app rather than "something
+  // went wrong".
+  async function handleLeaseConnect() {
+    isLeaseConnecting = true
+    leaseError = ''
+    try {
+      const status = await api.minimaxLeaseStatus(providerId)
+      if (!status.found) {
+        leaseError = status.message || 'Could not reach the MiniMax Code desktop app'
+        return
+      }
+      const res = await api.minimaxLeaseConnect(providerId)
+      if (!res.success) {
+        leaseError = 'Could not create the lease connection'
+        return
+      }
+      onRefresh()
+    } catch (err) {
+      leaseError = err instanceof Error ? err.message : 'Could not reach the MiniMax Code desktop app'
+    } finally {
+      isLeaseConnecting = false
+    }
+  }
   // Add Connection Button flow
   async function handleAddConnectionClick() {
     if (providerId === 'antigravity') {
@@ -1456,6 +1599,8 @@
       openAuthCodeOAuth()
     } else if (isCustomOAuth) {
       openCustomOAuth()
+    } else if (providerId === 'free-pi') {
+      showFreePiConnect = true
     } else if (providerId === 'kiro') {
       openKiroOAuth()
     } else if (isDeviceOAuth) {
@@ -1840,6 +1985,24 @@
   }
 
 
+  let isPollingDevice = $state(false)
+
+  async function clearFreePiSession() {
+    if (!freePiConn || freePiResetBusy) return
+    freePiResetBusy = true
+    freePiResetResult = ''
+    try {
+      const res = await api.freePiResetSession(freePiConn.id)
+      freePiResetResult = res.released
+        ? 'Cleared your other sessions — you can start a new one now.'
+        : 'No other session was running.'
+    } catch (err) {
+      freePiResetResult = err instanceof Error ? err.message : String(err)
+    } finally {
+      freePiResetBusy = false
+    }
+  }
+
   async function openDeviceOAuth() {
     oauthError = null
     callbackInput = ''
@@ -1856,7 +2019,6 @@
       if (typeof window !== 'undefined' && oauthAuthUrl) {
         window.open(oauthAuthUrl, '_blank')
       }
-      pollDeviceOnce()
       devicePollTimer = setInterval(pollDeviceOnce, deviceInterval * 1000)
     } catch (err) {
       oauthError = err instanceof Error ? err.message : String(err)
@@ -1865,9 +2027,17 @@
   }
 
   async function pollDeviceOnce() {
-    if (!showOAuthModal || !deviceCode) return
+    if (!showOAuthModal || !deviceCode || isPollingDevice) return
+    isPollingDevice = true
     try {
       const res = await api.devicePoll(providerId, deviceCode, deviceSession)
+      if (res?.interval && res.interval > deviceInterval) {
+        deviceInterval = res.interval
+        if (devicePollTimer) {
+          clearInterval(devicePollTimer)
+          devicePollTimer = setInterval(pollDeviceOnce, deviceInterval * 1000)
+        }
+      }
       if (res?.status === 'authorized') {
         stopDevicePoll()
         showOAuthModal = false
@@ -1878,6 +2048,8 @@
       }
     } catch {
       // Biarkan polling berikutnya mencoba lagi.
+    } finally {
+      isPollingDevice = false
     }
   }
 
@@ -2343,10 +2515,10 @@
     limits?: { contextWindow?: number; maxOutput?: number },
   ) {
     try {
-      await api.saveCustomModel(`${storageAlias}|${modelId}|llm`, {
+      await api.saveCustomModel(customModelKeyFor(storageAlias, modelId), {
         id: modelId,
         providerAlias: storageAlias,
-        type: 'llm',
+        type: inferModelKind(modelId),
         ...(caps ? { caps } : {}),
         ...(limits?.contextWindow ? { contextWindow: limits.contextWindow } : {}),
         ...(limits?.maxOutput ? { maxOutput: limits.maxOutput } : {}),
@@ -2491,7 +2663,7 @@
       // the response says which lines landed instead of leaving it to the refresh.
       const out = await api.saveCustomModelsBulk({
         providerAlias: storageAlias,
-        models: plan.ids.map((id) => ({ id, type: 'llm' })),
+        models: plan.ids.map((id) => ({ id, type: inferModelKind(id) })),
       })
       newCompatibleModel = ''
       await refreshCompatibleModels()
@@ -2517,10 +2689,10 @@
     }
     isAddingCompatibleModel = true
     try {
-      await api.saveCustomModel(`${storageAlias}|${modelId}|llm`, {
+      await api.saveCustomModel(customModelKeyFor(storageAlias, modelId), {
         id: modelId,
         providerAlias: storageAlias,
-        type: 'llm',
+        type: inferModelKind(modelId),
       })
       newCompatibleModel = ''
       await refreshCompatibleModels()
@@ -2535,10 +2707,10 @@
     }
   }
 
-  async function handleDeleteCompatibleModel(row: { id: string; source: string; alias?: string }) {
+  async function handleDeleteCompatibleModel(row: { id: string; source: string; alias?: string; kind?: string }) {
     try {
       if (row.source === 'custom') {
-        await api.deleteCustomModel(`${storageAlias}|${row.id}|llm`)
+        await api.deleteCustomModel(customModelKeyFor(storageAlias, row.id, row.kind))
       } else if (row.source === 'legacyAlias' && row.alias) {
         await api.deleteModelAlias(row.alias)
       }
@@ -2611,7 +2783,10 @@
   async function handleTestAllCompatibleModels() {
     if (compatibleTestAllRunning) return
     const pid = providerId
-    const ids = compatibleRows.map((r) => r.id)
+    // A probe is a chat request, so only chat rows are probed: a TTS or video
+    // model answers one with an error, and reporting that as a dead model would
+    // be a false failure for a model that works on its own lane.
+    const ids = compatibleRows.filter((r) => isChatModel({ type: r.kind })).map((r) => r.id)
     if (ids.length === 0) return
     compatibleTestAllRunning = true
     compatibleTestResults = {}
@@ -2674,8 +2849,8 @@
         if (freeOnly && !isFreeTierModelId(modelId)) continue
         pending.push({
           id: modelId,
-          key: `${storageAlias}|${modelId}|llm`,
-          value: { id: modelId, providerAlias: storageAlias, type: 'llm' },
+          key: customModelKeyFor(storageAlias, modelId),
+          value: { id: modelId, providerAlias: storageAlias, type: inferModelKind(modelId) },
         })
       }
       const outcome = await importCustomModelsBestEffort(pending, api.saveCustomModel)
@@ -2751,11 +2926,11 @@
             : 0
         pending.push({
           id: modelId,
-          key: `${storageAlias}|${modelId}|llm`,
+          key: customModelKeyFor(storageAlias, modelId),
           value: {
             id: modelId,
             providerAlias: storageAlias,
-            type: 'llm',
+            type: inferModelKind(modelId),
             ...(caps ? { caps } : {}),
             ...(declaredCtxLen > 0 ? { contextWindow: declaredCtxLen } : {}),
             ...(declaredMaxOut > 0 ? { maxOutput: declaredMaxOut } : {}),
@@ -2848,7 +3023,7 @@
   let canListLiveModels = $derived(
     providerId.startsWith('openai-compatible-') ||
       isCompatibleNode ||
-      ['antigravity', 'gemini-cli', 'cline', 'clinepass', 'qoder', 'qoder-cn', 'zed'].includes(providerId) ||
+      ['antigravity', 'gemini-cli', 'cline', 'clinepass', 'qoder', 'qoder-cn', 'zed', 'claude', 'anthropic'].includes(providerId) ||
       ModelsListURLs.has(providerId)
   )
 
@@ -2892,10 +3067,10 @@
 
   async function handleAddLatestModel(id: string, name?: string) {
     try {
-      await api.saveCustomModel(`${storageAlias}|${id}|llm`, {
+      await api.saveCustomModel(customModelKeyFor(storageAlias, id), {
         id,
         providerAlias: storageAlias,
-        type: 'llm',
+        type: inferModelKind(id),
         ...(name ? { name } : {}),
       })
       latestModels = latestModels.filter((m) => m.id !== id)
@@ -3052,6 +3227,63 @@
   }
 
   /**
+   * Disables every model whose last probe failed or whose account is in
+   * cooldown, in one request.
+   *
+   * The verdicts are already on screen from the sweep that produced them, so
+   * this sends only the failures — the server merges them into the stored
+   * list, which is what keeps two open tabs from disabling each other's
+   * models. "Blocked" counts as dead here: the account is parked and the model
+   * cannot serve until the cooldown lifts, which is the same operator-visible
+   * outcome as a failure. A model that was never probed is not included —
+   * nobody has evidence about it.
+   */
+  async function handleAutoDisableDeadModels() {
+    const pid = providerId
+    const deadIds = isCompatibleNode
+      ? compatibleRows
+          .filter((r) => {
+            const s = compatibleTestResults[r.id]
+            return s === 'error' || s === 'blocked'
+          })
+          .map((r) => r.id)
+      : allAvailableModels
+          .filter((m) => {
+            const s = modelTestStatuses[m.id]
+            return s === 'error' || s === 'blocked'
+          })
+          .map((m) => m.id)
+    if (deadIds.length === 0) {
+      alert('No dead models — every model that was probed either passed or has not been tested yet.')
+      return
+    }
+    const preview = await api
+      .autoDisableModels(storageAlias, deadIds, true)
+      .catch(() => null)
+    const alreadyOff = preview?.alreadyDisabled.length ?? 0
+    const willDisable = preview?.disabled.length ?? deadIds.length
+    const parts = [`Disable ${willDisable} dead model(s)?`]
+    if (alreadyOff > 0) parts.push(`${alreadyOff} already disabled.`)
+    parts.push('They stop appearing in /v1/models and every model picker, and leave the combos they were in.')
+    if (!confirm(parts.join(' '))) return
+
+    try {
+      const res = await api.autoDisableModels(storageAlias, deadIds)
+      if (pid !== providerId) return
+      const modelsData = await fetchProviderModelsData(providerId, storageAlias)
+      disabledModelIds = modelsData.disabledModelIds
+      customModels = modelsData.customModels
+      notifyCustomModelsChanged()
+      selectedModelIds = new Set()
+      const summary = [`${res.disabled.length} disabled`]
+      if (res.alreadyDisabled.length > 0) summary.push(`${res.alreadyDisabled.length} already off`)
+      alert(`${summary.join(', ')}.`)
+    } catch (err) {
+      alert(`Auto-disable failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /**
    * Delete selected: custom models are removed from the store, registry
    * models are static and get disabled instead (the existing single-row
    * rule), and compatible legacy aliases lose their alias. One confirm for
@@ -3078,12 +3310,13 @@
           await handleDisableModel(row.id)
           disabledOnly++
         } else if (row.source === 'legacyAlias') {
-          const alias = compatibleRows.find((r) => r.id === row.id)?.alias
-          if (alias) await api.deleteModelAlias(alias)
-          else await api.deleteCustomModel(`${storageAlias}|${row.id}|llm`)
+          const match = compatibleRows.find((r) => r.id === row.id)
+          if (match?.alias) await api.deleteModelAlias(match.alias)
+          else await api.deleteCustomModel(customModelKeyFor(storageAlias, row.id, match?.kind))
           deleted++
         } else {
-          await api.deleteCustomModel(`${storageAlias}|${row.id}|llm`)
+          const stored = compatibleRows.find((r) => r.id === row.id)?.kind
+          await api.deleteCustomModel(customModelKeyFor(storageAlias, row.id, stored))
           deleted++
         }
       } catch (err) {
@@ -3109,7 +3342,7 @@
     if (custom) {
       if (!confirm(`Delete custom model "${modelId}"?`)) return
       try {
-        await api.deleteCustomModel(`${storageAlias}|${modelId}|llm`)
+        await api.deleteCustomModel(customModelKeyFor(storageAlias, modelId, custom.type))
         const modelsData = await fetchProviderModelsData(providerId, storageAlias)
         customModels = modelsData.customModels
         notifyCustomModelsChanged()
@@ -3180,42 +3413,70 @@
       Back to Providers
     </button>
 
-    <div class="flex min-w-0 items-center gap-3 sm:gap-4">
-      <div
-        class="flex size-12 shrink-0 items-center justify-center rounded-lg"
-        style="background-color: {providerColor}15;"
-      >
-        <ProviderIcon
-          id={providerId}
-          apiType={selectedNode?.apiType}
-          size="lg"
-          class="border-transparent bg-transparent"
-        />
+    <div class="flex min-w-0 items-center justify-between gap-3 sm:gap-4">
+      <div class="flex min-w-0 items-center gap-3 sm:gap-4">
+        <div
+          class="flex size-12 shrink-0 items-center justify-center rounded-lg"
+          style="background-color: {providerColor}15;"
+        >
+          <ProviderIcon
+            id={providerId}
+            apiType={selectedNode?.apiType}
+            size="lg"
+            class="border-transparent bg-transparent"
+          />
+        </div>
+
+        <div class="min-w-0">
+          <div class="flex items-center gap-3 flex-wrap">
+            <h1 class="truncate text-2xl font-semibold tracking-tight sm:text-3xl">
+              {providerName}
+            </h1>
+            {#if providerWebsite}
+              <a
+                href={providerWebsite}
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-xs text-primary hover:underline inline-flex items-center gap-1"
+              >
+                <span class="material-symbols-outlined text-sm">open_in_new</span>
+                {providerWebsiteLabel}
+              </a>
+            {/if}
+          </div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <p class="text-text-muted">
+              {providerConnections.length} connection{providerConnections.length === 1 ? '' : 's'}
+            </p>
+            {#if isProviderAllDisabled}
+              <Badge variant="default" size="sm">
+                <span class="flex items-center gap-1">
+                  <PauseCircle class="w-3 h-3" />
+                  Disabled
+                </span>
+              </Badge>
+            {/if}
+          </div>
+        </div>
       </div>
 
-      <div class="min-w-0">
-        <div class="flex items-center gap-3 flex-wrap">
-          <h1 class="truncate text-2xl font-semibold tracking-tight sm:text-3xl">
-            {providerName}
-          </h1>
-          {#if providerWebsite}
-            <a
-              href={providerWebsite}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="text-xs text-primary hover:underline inline-flex items-center gap-1"
-            >
-              <span class="material-symbols-outlined text-sm">open_in_new</span>
-              {providerWebsiteLabel}
-            </a>
-          {/if}
+      {#if providerConnections.length > 0}
+        <div class="flex shrink-0 items-center gap-2 self-center ml-auto">
+          <Toggle
+            size="sm"
+            checked={isProviderActive}
+            onChange={handleToggleProvider}
+            title={isProviderActive ? 'Disable all connections for this provider' : 'Enable all connections for this provider'}
+          />
         </div>
-        <p class="text-text-muted">
-          {providerConnections.length} connection{providerConnections.length === 1 ? '' : 's'}
-        </p>
-      </div>
+      {/if}
     </div>
   </div>
+
+  <!-- Claude prompt-cache window: a billing knob that belongs on the provider page. -->
+  {#if providerId === 'claude'}
+    <ClaudeCacheTtl />
+  {/if}
 
   <!-- 1. Risk Notice (for OAuth / subscription providers) -->
   {#if hasRiskNotice}
@@ -3267,6 +3528,22 @@
           >
             <span class="material-symbols-outlined text-[18px]">add</span>
             Add API Key
+          </button>
+          <button
+            type="button"
+            onclick={() => (showExportKeysModal = true)}
+            class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px] w-full sm:w-auto"
+          >
+            <span class="material-symbols-outlined text-[18px]">download</span>
+            Export Keys
+          </button>
+          <button
+            type="button"
+            onclick={() => (showShareProviderModal = true)}
+            class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px] w-full sm:w-auto"
+          >
+            <span class="material-symbols-outlined text-[18px]">link</span>
+            Share
           </button>
           <button
             type="button"
@@ -3525,8 +3802,50 @@
       </div>
     {/if}
 
+    <!-- Connection tabs: Active / Error / Banned. Every connection belongs to
+         exactly one tab; banned connections are excluded from Error. -->
+    <div class="flex gap-1 border border-border rounded-lg bg-surface px-1 py-1 sm:px-2">
+      <button
+        type="button"
+        onclick={() => (connTab = 'active')}
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors {connTab === 'active'
+          ? 'bg-primary text-white shadow-[var(--shadow-warm)]'
+          : tabCounts.active === 0
+            ? 'text-text-muted/40 pointer-events-none'
+            : 'text-text-main hover:text-text-main hover:bg-surface-2'}"
+        disabled={tabCounts.active === 0}
+      >
+        Active <span class="ml-1">{tabCounts.active}</span>
+      </button>
+      <button
+        type="button"
+        onclick={() => (connTab = 'error')}
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors {connTab === 'error'
+          ? 'bg-red-500/10 text-red-600 dark:text-red-400 shadow-[var(--shadow-warm)]'
+          : tabCounts.error === 0
+            ? 'text-text-muted/40 pointer-events-none'
+            : 'text-text-main hover:text-text-main hover:bg-surface-2'}"
+        disabled={tabCounts.error === 0}
+      >
+        Error <span class="ml-1">{tabCounts.error}</span>
+      </button>
+      <button
+        type="button"
+        onclick={() => (connTab = 'banned')}
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors {connTab === 'banned'
+          ? 'bg-orange-500/10 text-orange-600 dark:text-orange-400 shadow-[var(--shadow-warm)]'
+          : tabCounts.banned === 0
+            ? 'text-text-muted/40 pointer-events-none'
+            : 'text-text-main hover:text-text-main hover:bg-surface-2'}"
+        disabled={tabCounts.banned === 0}
+      >
+        <span class="material-symbols-outlined text-[14px] mr-1">block</span>
+        Banned <span class="ml-1">{tabCounts.banned}</span>
+      </button>
+    </div>
+
     <!-- Connections List -->
-      {#if providerConnections.length === 0}
+      {#if tabConnections.length === 0}
       <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div class="flex items-center gap-3">
           <div class="inline-flex items-center justify-center w-9 h-9 rounded-full bg-primary/10 text-primary shrink-0">
@@ -3604,7 +3923,7 @@
            click-away backdrop over the whole viewport, which otherwise swallows
            the first click on any priority chevron. -->
       <div class="relative z-50 flex min-w-0 flex-col divide-y divide-black/[0.03] dark:divide-white/[0.03] max-h-[500px] overflow-y-auto pr-1">
-        {#each providerConnections as conn, idx (conn.id)}
+        {#each tabConnections as conn, idx (conn.id)}
           {@const isFirst = idx === 0}
           {@const isLast = idx === providerConnections.length - 1}
           {@const isSelected = selectedConnIds.includes(conn.id)}
@@ -3620,6 +3939,7 @@
                connection's persisted testStatus; the markup below only renders
                the verdict it returns. -->
           {@const connBadge = badgeFor(status, conn.testStatus, lastErr)}
+          {#if tabMatches(conn)}
           <div class="flex min-w-0 items-stretch">
             <!-- Multi-select checkbox -->
             <div class="flex shrink-0 items-center pl-1 sm:pl-2">
@@ -3667,9 +3987,22 @@
 
                   <!-- Title & badges -->
                   <div class="flex-1 min-w-0">
-                    <p class="text-sm font-medium truncate">
-                      {formatEmailLabel(conn.name || conn.email || (conn.authType === 'oauth' ? 'OAuth Account' : 'API Key Slot'), $emailPrivacy)}
-                    </p>
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <p class="text-sm font-medium truncate">
+                        {formatEmailLabel(conn.name || conn.email || (conn.authType === 'oauth' ? 'OAuth Account' : 'API Key Slot'), $emailPrivacy)}
+                      </p>
+                      {#if providerId === 'mistral'}
+                        {#if specificData?.usageLane === 'vibe' || (conn.name && conn.name.toLowerCase().includes('vibe'))}
+                          <span class="inline-flex items-center gap-1 rounded font-semibold bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 px-1.5 py-0.5 text-[10px]">
+                            VIBE CODE
+                          </span>
+                        {:else if specificData?.usageLane === 'api' || (conn.name && conn.name.toLowerCase().includes('api'))}
+                          <span class="inline-flex items-center gap-1 rounded font-semibold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 px-1.5 py-0.5 text-[10px]">
+                            API PAYG
+                          </span>
+                        {/if}
+                      {/if}
+                    </div>
                     <!-- Secondary label: upstream ConnectionRow shows the email
                          under a name, or the displayName when the stored name is
                          the email (which is what the Qoder device flow writes). -->
@@ -3950,6 +4283,14 @@
                       {/if}
                       <MenuItem label="Edit" icon="edit" onSelect={() => openEditConnection(conn)} />
 
+                      {#if appealUrl(conn)}
+                        <MenuItem
+                          label="Submit Appeal"
+                          icon="open_in_new"
+                          onSelect={() => openAppeal(appealUrl(conn)!)}
+                        />
+                      {/if}
+
                       <div class="my-1 border-t border-border-subtle" role="separator"></div>
 
                       <MenuItem label="Delete" icon="delete" danger onSelect={() => handleDeleteConnection(conn)} />
@@ -3975,6 +4316,7 @@
               </div>
             </div>
           </div>
+        {/if}
         {/each}
       </div>
     {/if}
@@ -4001,6 +4343,28 @@
           <span class="material-symbols-outlined text-[18px]">login</span>
           Connect Kiro
         </button>
+      {:else if isLeaseProvider}
+        <button
+          type="button"
+          onclick={handleAddConnectionClick}
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px] w-full sm:w-auto"
+        >
+          <span class="material-symbols-outlined text-[18px]">login</span>
+          Sign In
+        </button>
+        <button
+          type="button"
+          onclick={handleLeaseConnect}
+          disabled={isLeaseConnecting}
+          title="Borrow the signed-in MiniMax Code desktop app's login — no second sign-in, refresh stays with the desktop app"
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-brand-500 hover:bg-brand-600 text-white shadow-sm h-7 px-3 text-xs rounded-[8px] w-full sm:w-auto disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          <span class="material-symbols-outlined text-[18px]">desktop_windows</span>
+          {isLeaseConnecting ? 'Connecting...' : 'Use Desktop App'}
+        </button>
+        {#if leaseError}
+          <p class="w-full text-xs text-error break-words">{leaseError}</p>
+        {/if}
       {:else if hasDualAuthModes}
         <button
           type="button"
@@ -4026,6 +4390,24 @@
         >
           <span class="material-symbols-outlined text-[18px]">add</span>
           Add
+        </button>
+      {/if}
+      {#if providerConnections.length > 0}
+        <button
+          type="button"
+          onclick={() => (showExportKeysModal = true)}
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px] w-full sm:w-auto"
+        >
+          <span class="material-symbols-outlined text-[18px]">download</span>
+          Export Keys
+        </button>
+        <button
+          type="button"
+          onclick={() => (showShareProviderModal = true)}
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px] w-full sm:w-auto"
+        >
+          <span class="material-symbols-outlined text-[18px]">link</span>
+          Share
         </button>
       {/if}
     </div>
@@ -4122,6 +4504,16 @@
             <span class="material-symbols-outlined text-[16px]">{isRemovingCompatibleModels ? 'progress_activity' : 'delete_sweep'}</span>
             {isRemovingCompatibleModels ? 'Removing...' : 'Remove all models'}
           </button>
+          <button
+            type="button"
+            onclick={handleAutoDisableDeadModels}
+            disabled={compatibleRows.length === 0}
+            title="Disable every model whose last probe failed or whose account is in cooldown. They stop appearing in /v1/models and every model picker, and leave the combos they were in."
+            class="inline-flex h-8 items-center justify-center gap-1.5 rounded-[8px] border border-amber-500/40 bg-amber-500/10 px-3 text-xs font-medium text-amber-600 transition-colors hover:bg-amber-500/20 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed dark:text-amber-400"
+          >
+            <span class="material-symbols-outlined text-[16px]">heart_broken</span>
+            Disable dead models
+          </button>
         </div>
         <p class="text-xs text-text-muted">Test all sends a real completion per model and consumes account quota.</p>
         <p class="text-xs text-text-muted">Remove all deletes this node's imported models and the aliases pointing at them; models that ship with the build stay.</p>
@@ -4137,18 +4529,17 @@
         <ModelFilterChips
           filter={modelListFilter}
           onChange={(f) => (modelListFilter = f)}
-          showStatus={false}
           {availableCaps}
         />
         <ModelBatchBar
           selection={currentSelection}
           busy={compatibleTestAllRunning}
-          canDisable={false}
+          canDisable
           canDelete={selectedRowsHaveCustom}
           onToggleAll={handleToolbarToggleAll}
           onTest={handleTestSelectedCompatibleModels}
-          onDisable={() => {}}
-          onEnable={() => {}}
+          onDisable={handleDisableSelectedModels}
+          onEnable={handleEnableSelectedModels}
           onDelete={handleDeleteSelectedModels}
           onClear={handleToolbarClearSelection}
         />
@@ -4178,8 +4569,8 @@
               </span>
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-medium truncate">{row.id}</p>
-                <div class="flex items-center gap-1 mt-1">
-                  <code class="text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded">{displayAlias()}/{row.id}</code>
+                <div class="flex items-center gap-1 mt-1 flex-wrap">
+                  <code class="max-w-[72vw] truncate text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded sm:max-w-[360px]">{displayAlias()}/{row.id}</code>
                   <!-- Capability icons, mirroring the registered grid's row:
                        the same model id can be imported into a compatible
                        node, and a row that shows nothing there reads as a
@@ -4240,7 +4631,31 @@
                   {#if tStatus && compatibleTestLatency[row.id] !== undefined}
                     <span class="text-xs text-text-muted font-mono">{compatibleTestLatency[row.id]} ms</span>
                   {/if}
+                  <!-- Enable/disable this one row. A disabled row stops being
+                       published by /v1/models and disappears from the pickers,
+                       which is the difference between this and Delete: the row
+                       stays here, reversible, and the import that wrote it is
+                       left alone. -->
+                  <div class="relative group/btn">
+                    <button
+                      type="button"
+                      onclick={() => (row.disabled ? handleEnableModel(row.id) : handleDisableModel(row.id))}
+                      class="p-0.5 rounded text-text-muted transition-colors hover:text-primary cursor-pointer {row.disabled ? 'text-amber-500' : ''}"
+                      title={row.disabled ? 'Enable this model — it returns to /v1/models and the pickers' : 'Disable this model — it stops appearing in /v1/models and the pickers'}
+                    >
+                      <span class="material-symbols-outlined text-sm">{row.disabled ? 'visibility_off' : 'visibility'}</span>
+                    </button>
+                    <span class="pointer-events-none absolute top-5 left-1/2 -translate-x-1/2 text-[10px] text-text-muted whitespace-nowrap opacity-0 group-hover/btn:opacity-100 transition-opacity">
+                      {row.disabled ? 'Disabled — enable' : 'Disable'}
+                    </span>
+                  </div>
                 </div>
+                {#if row.disabled}
+                  <div class="mt-2 flex items-start gap-1.5 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 px-2.5 py-1.5 rounded-md border border-amber-500/20">
+                    <span class="material-symbols-outlined text-sm shrink-0 mt-0.5">visibility_off</span>
+                    <span class="font-medium leading-relaxed">Disabled — hidden from <code class="font-mono">/v1/models</code> and every model picker. The row stays here so you can enable it again.</span>
+                  </div>
+                {/if}
                 {#if tError}
                   <div class="mt-2 flex items-start gap-1.5 text-xs text-red-500 bg-red-500/10 px-2.5 py-1.5 rounded-md border border-red-500/20">
                     <span class="material-symbols-outlined text-sm shrink-0 mt-0.5">error</span>
@@ -4331,8 +4746,27 @@
         </button>
       </div>
     {/if}
+    {#if isFreePi && freePiConn}
+      <div class="mb-4">
+        <FreePiAdBanner connectionId={freePiConn.id} />
+        <div class="flex flex-wrap items-center gap-2 rounded-[10px] border border-border-subtle bg-surface-2 px-3 py-2">
+          <span class="material-symbols-outlined text-[16px] text-text-muted" aria-hidden="true">layers_clear</span>
+          <span class="text-[11px] text-text-muted">Clear this account's other sessions if a stale one blocks a request.</span>
+          <button type="button" onclick={clearFreePiSession} disabled={freePiResetBusy}
+            class="ml-auto shrink-0 rounded-lg border border-border px-2.5 py-1 text-[11px] font-medium text-text-main hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-50">
+            {freePiResetBusy ? 'Clearing…' : 'Clear session'}
+          </button>
+        </div>
+        {#if freePiResetResult}
+          <p class="mt-1 text-[11px] text-text-muted">{freePiResetResult}</p>
+        {/if}
+      </div>
+    {/if}
     {#if isFreebuff}
       <div class="mb-4">
+        {#if targetFreebuffConn}
+          <FreebuffAdBanner connectionId={targetFreebuffConn.id} />
+        {/if}
         <FreebuffSessionBanner
           session={freebuffSession}
           isLoading={isLoadingSession}
@@ -4542,7 +4976,7 @@
         Add Model
       </button>
 
-      {#if (providerId === 'cline' || providerId === 'clinepass' || providerId === 'qoder' || providerId === 'qoder-cn' || providerId === 'commandcode' || providerId === 'vercel-ai-gateway' || providerId === 'chutes' || providerId === 'nvidia' || providerId === 'ollama' || providerId === 'openrouter') && providerConnections.some((c) => c.isActive !== 0)}
+      {#if (providerId === 'cline' || providerId === 'clinepass' || providerId === 'qoder' || providerId === 'qoder-cn' || providerId === 'commandcode' || providerId === 'commandcode-goat' || providerId === 'vercel-ai-gateway' || providerId === 'chutes' || providerId === 'nvidia' || providerId === 'ollama' || providerId === 'openrouter') && providerConnections.some((c) => c.isActive !== 0)}
         <button
           type="button"
           onclick={handleImportLiveCatalogModels}
@@ -4572,6 +5006,16 @@
           {isCheckingAll
             ? `Checking ${checkAllProgress.done}/${checkAllProgress.total}...`
             : `Check All Models (${visibleModels.length})`}
+        </button>
+        <button
+          type="button"
+          onclick={handleAutoDisableDeadModels}
+          disabled={isCheckingAll}
+          class="flex w-full items-center justify-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 px-3 py-2 text-xs text-amber-600 transition-colors sm:w-auto cursor-pointer disabled:opacity-50 dark:text-amber-400"
+          title="Disable every model whose last probe failed or whose account is in cooldown. They stop appearing in /v1/models and every model picker, and leave the combos they were in."
+        >
+          <span class="material-symbols-outlined text-sm">heart_broken</span>
+          Disable dead models
         </button>
       {/if}
 
@@ -4611,7 +5055,7 @@
           <div class="flex flex-col gap-1.5">
             {#each latestModels as m (m.id)}
               <div class="flex items-center gap-2">
-                <code class="flex-1 truncate text-xs font-mono bg-sidebar px-1.5 py-1 rounded">{m.id}</code>
+                <code class="flex-1 min-w-0 break-all sm:truncate text-xs font-mono bg-sidebar px-1.5 py-1 rounded">{m.id}</code>
                 <button
                   type="button"
                   onclick={() => handleAddLatestModel(m.id, m.name)}
@@ -4975,6 +5419,7 @@
             </div>
           </div>
         {/if}
+        {#if !deviceUserCode}
         <div>
           <p class="text-sm font-medium mb-1">
             {providerId === 'freebuff'
@@ -5002,6 +5447,7 @@
                   : 'Paste the access token here, then click Connect.'}
           </p>
         </div>
+        {/if}
 
         {#if oauthError}
           <p class="text-xs text-red-500">{oauthError}</p>
@@ -5017,10 +5463,10 @@
                 submitManualCallback()
               }
             }}
-            disabled={isConnecting}
+            disabled={isConnecting || isPollingDevice}
             class="flex-1 py-1.5 text-xs font-semibold rounded-[8px] bg-brand-500 hover:bg-brand-600 text-white shadow-sm disabled:opacity-50 cursor-pointer"
           >
-            {isConnecting ? 'Checking…' : deviceUserCode ? 'Check now' : providerId === 'freebuff' ? 'Check & Connect' : 'Connect'}
+            {isConnecting || isPollingDevice ? 'Checking…' : deviceUserCode ? 'Check now' : providerId === 'freebuff' ? 'Check & Connect' : 'Connect'}
           </button>
           <button
             type="button"
@@ -5121,7 +5567,7 @@
                   <span class="text-[10px] text-text-muted">(inactive)</span>
                 {/if}
               </div>
-              <div class="text-[11px] text-text-muted truncate">{pool.proxyUrl}</div>
+              <div class="text-[11px] text-text-muted break-all sm:truncate">{pool.proxyUrl}</div>
             </div>
           </button>
         {:else}
@@ -5177,6 +5623,12 @@
   onClose={() => (showHeaderOverrides = false)}
 />
 
+<FreePiConnectModal
+  isOpen={showFreePiConnect}
+  onClose={() => (showFreePiConnect = false)}
+  onConnected={onRefresh}
+/>
+
 <!-- 5b. Edit Compatible Node Modal (upstream EditCompatibleNodeModal parity) -->
 <EditCompatibleNodeModal
   isOpen={showEditNodeModal && isCompatibleNode}
@@ -5205,4 +5657,21 @@
   }}
   onSubmit={handleAddKeyConnection}
   onBulkDone={onRefresh}
+/>
+
+<ExportKeysModal
+  isOpen={showExportKeysModal}
+  providerId={providerId}
+  providerName={providerName}
+  onClose={() => (showExportKeysModal = false)}
+/>
+<ShareProviderModal
+  isOpen={showShareProviderModal}
+  providerId={providerId}
+  providerName={providerName}
+  isCompatibleNode={isCompatibleNode}
+  node={selectedNode}
+  connections={providerConnections}
+  availableProviders={shareableProviders}
+  onClose={() => (showShareProviderModal = false)}
 />

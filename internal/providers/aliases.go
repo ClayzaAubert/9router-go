@@ -33,6 +33,7 @@ var ProviderAliasMap = map[string]string{
 	"ch":             "chutes",
 	"cl":             "cline",
 	"cmc":            "commandcode",
+	"cmc-goat":       "commandcode-goat",
 	"cp":             "clinepass",
 	"cu":             "cursor",
 	"cx":             "codex",
@@ -45,6 +46,8 @@ var ProviderAliasMap = map[string]string{
 	"fb":             "freebuff",
 	"fish":           "fish-audio",
 	"fl":             "featherless",
+	"fp":             "free-pi",
+	"freepi":         "free-pi",
 	"fw":             "fireworks",
 	"gb":             "grok-cli",
 	"gc":             "gemini-cli",
@@ -64,6 +67,7 @@ var ProviderAliasMap = map[string]string{
 	"if":             "iflow",
 	"jina":           "jina-ai",
 	"kc":             "kilocode",
+	"ki":             "kenari",
 	"km":             "kimi",
 	"kr":             "kiro",
 	"mimo":           "xiaomi-mimo",
@@ -81,6 +85,7 @@ var ProviderAliasMap = map[string]string{
 	"muse-code":         "muse",
 	"muse-subscription": "muse",
 	"systemone":         "v1m",
+	"drex":              "nace",
 	// Upstream publishes `jev` as a v1m alias, but jev-1.13-free already
 	// belongs to opencode and jev-1.13 to opencode-zen. Registering it here
 	// would let `jev/<model>` cross into v1m, which AGENTS.md §3 forbids and
@@ -93,6 +98,7 @@ var ProviderAliasMap = map[string]string{
 	"nv":             "nvidia",
 	"oa":             "openai",
 	"oc":             "opencode",
+	"ocg":            "opencode-go",
 	"ocz":            "opencode-zen",
 	"or":             "openrouter",
 	"pa":             "perplexity-agent",
@@ -105,6 +111,8 @@ var ProviderAliasMap = map[string]string{
 	"qdcn":           "qoder-cn",
 	"runway":         "runwayml",
 	"stability":      "stability-ai",
+	"syn":            "synthetic",
+	"synthetic-new":  "synthetic",
 	"tg":             "together",
 	"vali":           "volcengine-ark",
 	"vercel":         "vercel-ai-gateway",
@@ -122,13 +130,23 @@ var ProviderAliasMap = map[string]string{
 	"ps":             "poolside",
 	"qianfan":        "baidu",
 	"samba":          "sambanova",
-	"tr":             "trae",
-	"voyage":         "voyage-ai",
-	"vx":             "vertex",
-	"vxp":            "vertex-partner",
-	"ws":             "windsurf",
-	"xq":             "xquik",
-	"zd":             "zed",
+	// "tr" belongs to tokenrouter, not trae. Upstream publishes trae's own
+	// alias as "tr" but keeps trae out of the registry array (a hidden entry:
+	// its SOLO agent has no tool calling), and builds the alias table from that
+	// array in order, so tokenrouter's aliases[] entry wins
+	// (open-sse/services/model.js:16-19). Verified against upstream:
+	// resolveProviderAlias("tr") === "tokenrouter".
+	"tr":       "tokenrouter",
+	"marscode": "trae",
+	"voyage":   "voyage-ai",
+	"vx":       "vertex",
+	"vxp":      "vertex-partner",
+	"ws":       "windsurf",
+	"xq":       "xquik",
+	"zd":       "zed",
+	"atmo":     "atmorouter",
+	"rc":       "runcrate",
+	"hc":       "hcnsec",
 }
 
 // ResolveAlias returns the canonical provider ID for an alias, or the alias itself if not found.
@@ -137,6 +155,35 @@ func ResolveAlias(alias string) string {
 		return canonical
 	}
 	return alias
+}
+
+// ModelAliasResolution is the resolved form of a 9router model alias: the base
+// model id the request must be sent as plus the thinking config to attach.
+// A zero value means the id is not an alias and should be forwarded unchanged.
+type ModelAliasResolution struct {
+	Model           string // base model id to forward to the provider
+	ThinkingType    string // "enabled"|"disabled"|"" for top-level thinking.type
+	ReasoningEffort string // reasoning_effort value; "" deletes the field
+}
+
+// deepSeekV4ProModelAlias maps the 9router-only deepseek-v4-pro catalog aliases
+// to the base wire model plus the thinking config the request must carry. These
+// ids are not wire ids: deepseek-v4-pro-max asks for maximum reasoning effort,
+// deepseek-v4-pro-none asks for thinking to be disabled. Upstream forwards them
+// as the base model with thinking.type and reasoning_effort at top level
+// (never extra_body).
+var deepSeekV4ProModelAlias = map[string]ModelAliasResolution{
+	"deepseek-v4-pro-max":  {Model: "deepseek-v4-pro", ThinkingType: "enabled", ReasoningEffort: "max"},
+	"deepseek-v4-pro-none": {Model: "deepseek-v4-pro", ThinkingType: "disabled", ReasoningEffort: ""},
+}
+
+// ResolveModelAlias resolves a 9router model alias (e.g. deepseek-v4-pro-max,
+// deepseek-v4-pro-none) to the base model id plus the thinking config the
+// request must carry. Returns ok=false for ids that are not aliases, so the
+// caller forwards the id unchanged.
+func ResolveModelAlias(model string) (ModelAliasResolution, bool) {
+	r, ok := deepSeekV4ProModelAlias[model]
+	return r, ok
 }
 
 // IsNoAuthProvider reports whether a provider is marked noAuth in the registry,

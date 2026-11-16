@@ -2,6 +2,7 @@
   // Details-section dashboard (issue #280): activity heatmap and node health
   // above the request-details table.
   import { api, type UsageDashboardResponse, type UsageLifetime } from '../../api/client'
+  import { cachedUsageDashboard, rememberUsageDashboard } from '../../lib/usageDashboardCache'
   import { fmtTokens } from '../../lib/compactNumber'
   import Card from '../../lib/ui/Card.svelte'
   import ActivityHeatmap from './ActivityHeatmap.svelte'
@@ -52,6 +53,19 @@
         valueClass: 'text-success',
       },
       {
+        label: 'Success Rate',
+        value: l.successRate != null ? `${l.successRate.toFixed(1)}%` : '—',
+        sub: 'All time',
+        valueClass:
+          l.successRate == null
+            ? 'text-text-muted'
+            : l.successRate >= 95
+              ? 'text-success'
+              : l.successRate >= 80
+                ? 'text-warning'
+                : 'text-red-500',
+      },
+      {
         label: 'Most Used Model',
         value: l.topModel?.model || '—',
         sub: l.topModel
@@ -84,6 +98,16 @@
       loading = false
       return
     }
+    // A fresh entry from an earlier mount is drawn immediately: the panels are
+    // the same panels, and re-reading them would be a round trip whose answer
+    // is already on screen.
+    const cached = cachedUsageDashboard()
+    if (cached) {
+      data = cached
+      loading = false
+      failed = false
+      return
+    }
     let cancelled = false
     let settled = false
     loading = true
@@ -102,16 +126,16 @@
         if (cancelled || settled) return
         settled = true
         clearTimeout(timer)
+        rememberUsageDashboard(res)
         data = res
+        loading = false
       })
       .catch(() => {
         if (cancelled || settled) return
         settled = true
         clearTimeout(timer)
         failed = true
-      })
-      .finally(() => {
-        if (!cancelled && !settled) loading = false
+        loading = false
       })
     return () => {
       cancelled = true
@@ -139,7 +163,7 @@
     {#each detailBlocks as block (block.key)}
       {#if block.key === 'details.lifetime'}
     {#if cards.length > 0}
-      <div class="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 sm:gap-4">
+      <div class="grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 sm:gap-4">
         {#each cards as c (c.label)}
           <div class="bg-surface border border-border-subtle rounded-[14px] shadow-[var(--shadow-soft)] flex min-w-0 flex-col gap-1 px-4 py-3">
             <span class="truncate text-text-muted text-sm uppercase font-semibold">{c.label}</span>

@@ -6,10 +6,12 @@
   // bulk turn off empty / on available, quota hide/show via settings,
   // and per-connection refresh/toggle/delete actions.
   import { onMount } from 'svelte'
+  import ClaudeCacheTtl from './quota/ClaudeCacheTtl.svelte'
   import {
     api,
     type CodexResetCredit,
     type ConnectionUsageResponse,
+    type GLMResetCard,
     type ProviderConnection,
   } from '../api/client'
   import {
@@ -49,6 +51,7 @@
     getConnectionsEmptyMessage,
     getConnectionsPaginationSummary,
     getHiddenQuotaRows,
+    groupConnectionsByProvider,
     getProviderOptions,
     getQuotaCache,
     getQuotaVisibilityKey,
@@ -157,20 +160,21 @@
 
   // Quota visibility (hidden rows), persisted via /api/settings quotaVisibility
   let quotaVisibility = $state<QuotaVisibility>({})
-  let autoPingMaps = $state<{ claude: Record<string, boolean>; codex: Record<string, boolean> }>({
+  type AutoPingProvider = 'claude' | 'codex' | 'commandcode-goat'
+  type AutoPingScheduleEntry = AutoPingSchedule | { enabled: false } | unknown
+  let autoPingMaps = $state<Record<AutoPingProvider, Record<string, boolean>>>({
     claude: {},
     codex: {},
+    'commandcode-goat': {},
   })
   // The schedule half of the same settings key. It is kept apart from
   // autoPingMaps because the two are independent: the switch says "ping this
   // account when its window resets", the schedule says "ping it at 09:30 /
   // 14:30 / 19:30". Writing one must not delete the other.
-  let autoPingSchedules = $state<{
-    claude: Record<string, AutoPingSchedule | { enabled: false } | unknown>
-    codex: Record<string, AutoPingSchedule | { enabled: false } | unknown>
-  }>({
+  let autoPingSchedules = $state<Record<AutoPingProvider, Record<string, AutoPingScheduleEntry>>>({
     claude: {},
     codex: {},
+    'commandcode-goat': {},
   })
 
   // The connection whose auto-ping settings are being edited. Null closes the
@@ -276,11 +280,21 @@
   const AUTO_PING_SETTINGS_KEYS: Record<string, string> = {
     claude: 'claudeAutoPing',
     codex: 'codexAutoPing',
+    'commandcode-goat': 'commandcode-goatAutoPing',
   }
 
   const AUTO_PING_TOOLTIPS: Record<string, string> = {
     claude: 'When your 5h quota runs out, auto-sends a request the moment it resets so a new window starts right away.',
     codex: 'Auto-starts the next 5h Codex window after reset by sending a tiny request. Consumes a small amount of quota.',
+    'commandcode-goat':
+      'Auto-starts the next 5h Command Code window after reset by sending a tiny request. Consumes a small amount of quota.',
+  }
+
+  // Auto-ping was oauth-only because claude and codex are. Command Code
+  // authenticates with a bearer key, so its row is eligible without oauth.
+  function supportsAutoPing(conn: ProviderConnection): boolean {
+    if (conn.provider === 'commandcode-goat') return true
+    return (conn.provider === 'claude' || conn.provider === 'codex') && conn.authType === 'oauth'
   }
 
   function kiroMethodLabel(conn: ProviderConnectionLike): string {
@@ -332,6 +346,17 @@
   let resetCreditConfirming = $state(false)
   let resetCreditPending = $state<CodexResetCredit | null>(null)
 
+  // GLM Reset Cards (Z.ai international). Mirrors the Codex reset credits flow.
+  let glmResetCardConn = $state<ProviderConnection | null>(null)
+  let glmResetCardList = $state<GLMResetCard[]>([])
+  let glmResetCardSelected = $state('')
+  let glmResetCardLoading = $state(false)
+  let glmResetCardConsuming = $state(false)
+  let glmResetCardError = $state('')
+  let glmResetCardCount = $state(0)
+  let glmResetCardConfirming = $state(false)
+  let glmResetCardPending = $state<GLMResetCard | null>(null)
+
   // Redeeming spends the credit for good, so the chooser is two-step: pick a
   // credit, then confirm the irreversible action. Ported from OmniRoute's
   // CodexResetCreditsModal.
@@ -378,7 +403,9 @@
     resetCreditIdempotencyKey = newResetCreditIdempotencyKey()
     resetCreditLoading = true
     try {
-      const res = await api.listCodexResetCredits(conn.id)
+      const res = conn.provider === 'claude'
+        ? await api.listClaudeResetCredits(conn.id)
+        : await api.listCodexResetCredits(conn.id)
       if (res?.error) {
         resetCreditError = res.error
         resetCreditList = []
@@ -407,7 +434,9 @@
     resetCreditConsuming = true
     resetCreditError = ''
     try {
-      const res = await api.consumeCodexResetCredit(conn.id, credit.selectionToken, resetCreditIdempotencyKey)
+      const res = conn.provider === 'claude'
+        ? await api.consumeClaudeResetCredit(conn.id, credit.selectionToken, resetCreditIdempotencyKey)
+        : await api.consumeCodexResetCredit(conn.id, credit.selectionToken, resetCreditIdempotencyKey)
       if (res?.error) {
         resetCreditError = res.error
         return
@@ -425,13 +454,96 @@
     }
   }
 
+  // GLM Reset Cards handlers
+  function requestGlmResetCard(credit: GLMResetCard) {
+    if (glmResetCardConsuming) return
+    glmResetCardPending = credit
+    glmResetCardConfirming = true
+    glmResetCardError = ''
+  }
+
+  function backToGlmResetCardList() {
+    if (glmResetCardConsuming) return
+    glmResetCardConfirming = false
+    glmResetCardPending = null
+    glmResetCardError = ''
+  }
+
+  function closeGlmResetCards() {
+    if (glmResetCardConsuming) return
+    glmResetCardConn = null
+    glmResetCardList = []
+    glmResetCardSelected = ''
+    glmResetCardError = ''
+    glmResetCardCount = 0
+    glmResetCardConfirming = false
+    glmResetCardPending = null
+  }
+
+  async function openGlmResetCards(conn: ProviderConnection) {
+    glmResetCardConn = conn
+    glmResetCardList = []
+    glmResetCardSelected = ''
+    glmResetCardError = ''
+    glmResetCardCount = 0
+    glmResetCardConfirming = false
+    glmResetCardPending = null
+    glmResetCardLoading = true
+    try {
+      const res = await api.getGlmResetCards(conn.id)
+      if (res?.error) {
+        glmResetCardError = res.error
+        glmResetCardList = []
+        return
+      }
+      glmResetCardList = res?.cards ?? []
+      glmResetCardCount = res?.availableCount ?? 0
+      // The server returns them soonest-expiry first, so the default choice is
+      // the one that frees the quota soonest.
+      glmResetCardSelected = glmResetCardList[0]?.recordId ?? ''
+    } catch (err) {
+      glmResetCardError = err instanceof Error ? err.message : 'Failed to load GLM reset cards.'
+    } finally {
+      glmResetCardLoading = false
+    }
+  }
+
+  async function confirmGlmResetCard() {
+    const conn = glmResetCardConn
+    const credit = glmResetCardPending
+    if (!conn || !credit || glmResetCardConsuming) return
+    glmResetCardConsuming = true
+    glmResetCardError = ''
+    try {
+      const res = await api.redeemGlmResetCard(conn.id, { recordId: credit.recordId, type: credit.type })
+      if (res?.error) {
+        glmResetCardError = res.error
+        return
+      }
+      if (!res?.reset) {
+        glmResetCardError = res?.message || 'Failed to redeem the reset card.'
+        return
+      }
+      glmResetCardConn = null
+      glmResetCardList = []
+      glmResetCardSelected = ''
+      // The quota windows are what the user reset, so re-read them rather than
+      // leaving a stale reading on screen.
+      await refreshProvider(conn.id, conn.provider)
+    } catch (err) {
+      glmResetCardError = err instanceof Error ? err.message : 'Failed to redeem the GLM reset card.'
+    } finally {
+      glmResetCardConsuming = false
+    }
+  }
+
   async function toggleAutoPing(connId: string, provider: string, enabled: boolean) {
     const key = AUTO_PING_SETTINGS_KEYS[provider]
     if (!key) return
 
-    const currentConnections = autoPingMaps[provider as 'claude' | 'codex'] || {}
+    const currentConnections = autoPingMaps[provider as AutoPingProvider] || {}
     const nextConnections = { ...currentConnections, [connId]: enabled }
-    const nextSchedules = autoPingSchedules[provider as 'claude' | 'codex'] || {}
+    const nextSchedules = autoPingSchedules[provider as AutoPingProvider] || {}
 
     autoPingMaps = {
       ...autoPingMaps,
@@ -466,7 +578,7 @@
     autoPingEditing = null
     if (!conn) return
 
-    const provider = conn.provider as 'claude' | 'codex'
+    const provider = conn.provider as AutoPingProvider
     const key = AUTO_PING_SETTINGS_KEYS[provider]
     if (!key) return
 
@@ -764,6 +876,24 @@
     ) as ProviderConnection[],
   )
 
+  // Group the sorted rows by provider so the tracker reads as collapsible
+  // sections instead of one long flat list. Until the operator toggles a
+  // section, the first provider opens and the rest start collapsed.
+  let groupedConnections = $derived(groupConnectionsByProvider(sortedConnections))
+  let collapsedProviders = $state<Record<string, boolean> | null>(null)
+  let groupCollapsed = $derived.by<Record<string, boolean>>(() => {
+    if (collapsedProviders !== null) return collapsedProviders
+    const initial: Record<string, boolean> = {}
+    groupedConnections.forEach((group, index) => {
+      initial[group.provider] = index !== 0
+    })
+    return initial
+  })
+  function toggleProviderGroup(provider: string): void {
+    const base = groupCollapsed
+    collapsedProviders = { ...base, [provider]: !base[provider] }
+  }
+
   let hasEligibleConnections = $derived(totals.eligibleConnections > 0)
   let hasVisibleConnections = $derived(sortedConnections.length > 0)
   let emptyState = $derived(getConnectionsEmptyMessage(totals, providerFilter, accountFilter))
@@ -877,14 +1007,17 @@
         // two independent halves — the connections switch and the schedule map.
         const claudeConfig = raw?.claudeAutoPing as AutoPingSettings | undefined
         const codexConfig = raw?.codexAutoPing as AutoPingSettings | undefined
+        const commandCodeConfig = raw?.['commandcode-goatAutoPing'] as AutoPingSettings | undefined
 
         autoPingMaps = {
           claude: claudeConfig?.connections || {},
           codex: codexConfig?.connections || {},
+          'commandcode-goat': commandCodeConfig?.connections || {},
         }
         autoPingSchedules = {
           claude: claudeConfig?.schedules || {},
           codex: codexConfig?.schedules || {},
+          'commandcode-goat': commandCodeConfig?.schedules || {},
         }
       })
       .catch(() => {})
@@ -986,7 +1119,7 @@
         <button
           type="button"
           onclick={() => (providerMenuOpen = !providerMenuOpen)}
-          class="flex h-8 items-center justify-between gap-1 rounded-lg border border-border-subtle bg-surface-2 px-2 text-xs text-text-main transition-colors hover:bg-surface-3"
+          class="flex h-11 sm:h-8 items-center justify-between gap-1 rounded-lg border border-border-subtle bg-surface-2 px-2 text-xs text-text-main transition-colors hover:bg-surface-3"
           aria-haspopup="menu"
           aria-expanded={providerMenuOpen}
           title="Filter quota providers"
@@ -1067,7 +1200,7 @@
       <select
         bind:value={accountFilter}
         onchange={handleAccountFilterChange}
-        class="h-8 rounded-lg border border-border-subtle bg-surface-2 px-2 text-xs text-text-main outline-none transition-colors hover:bg-surface-3"
+        class="h-11 sm:h-8 rounded-lg border border-border-subtle bg-surface-2 px-2 text-xs text-text-main outline-none transition-colors hover:bg-surface-3"
         aria-label="Filter accounts by status"
       >
         {#each ACCOUNT_FILTER_OPTIONS as option (option.value)}
@@ -1079,7 +1212,7 @@
       {#if providerFilter === 'codex'}
         <select
           bind:value={quotaSortMode}
-          class="h-8 rounded-lg border border-border-subtle bg-surface-2 px-2 text-xs text-text-main outline-none transition-colors hover:bg-surface-3"
+          class="h-11 sm:h-8 rounded-lg border border-border-subtle bg-surface-2 px-2 text-xs text-text-main outline-none transition-colors hover:bg-surface-3"
           aria-label="Sort Codex quotas by remaining"
         >
           {#each QUOTA_SORT_OPTIONS as option (option.value)}
@@ -1169,9 +1302,41 @@
       <p class="mx-auto mt-2 max-w-md text-sm text-text-muted">{emptyState.description}</p>
     </div>
   {:else}
-    <!-- Provider cards: 2 columns, compact -->
-    <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
-      {#each sortedConnections as conn (conn.id)}
+    <!-- Provider groups: collapsible sections, two columns per section -->
+    <div class="space-y-5">
+      {#each groupedConnections as group (group.provider)}
+        <section>
+          <button
+            type="button"
+            onclick={() => toggleProviderGroup(group.provider)}
+            aria-expanded={!groupCollapsed[group.provider]}
+            class="mb-3 flex w-full items-center gap-2 rounded-lg px-1 py-1 text-left transition-colors hover:text-primary"
+          >
+            <span
+              class="material-symbols-outlined text-lg text-text-muted transition-transform {groupCollapsed[
+                group.provider
+              ]
+                ? ''
+                : 'rotate-90'}"
+            >
+              chevron_right
+            </span>
+            <img src={getIconPath(group.provider)} alt="" class="h-5 w-5 rounded" />
+            <span class="text-sm font-semibold text-text-main">{providerLabel(group.provider)}</span>
+            <span
+              class="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-text-muted"
+            >
+              {group.connections.length}
+            </span>
+          </button>
+          {#if !groupCollapsed[group.provider]}
+            {#if group.provider === 'claude'}
+              <div class="mb-3">
+                <ClaudeCacheTtl />
+              </div>
+            {/if}
+            <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+              {#each group.connections as conn (conn.id)}
         {@const isActive = isActiveConn(conn)}
         {@const quota = quotaData[conn.id]}
         {@const isLoading = quotaLoading[conn.id]}
@@ -1241,7 +1406,7 @@
                           type="button"
                           onclick={() => copyArn(profileArn, conn.id)}
                           title={profileArn}
-                          class="inline-flex max-w-full items-center gap-1 rounded-full border border-border-subtle px-2 py-0.5 text-[10px] text-text-muted transition-colors hover:text-primary cursor-pointer"
+                          class="inline-flex max-w-full items-center gap-1 rounded-full border border-border-subtle px-2.5 py-2 sm:py-0.5 text-[10px] text-text-muted transition-colors hover:text-primary cursor-pointer"
                         >
                           <span class="material-symbols-outlined text-[12px]">
                             {copiedArnId === conn.id ? 'check' : 'content_copy'}
@@ -1254,35 +1419,57 @@
                 </div>
               </div>
 
-              <div class="flex shrink-0 items-center gap-1">
-                {#if conn.provider === 'codex'}
+              <div class="flex shrink-0 items-center gap-2 sm:gap-1">
+                {#if conn.provider === 'codex' || conn.provider === 'claude'}
                   {@const resetCreditCount = getCodexResetCreditCount(quota)}
                   <button
                     type="button"
                     disabled={isLoading || rowBusy || resetCreditConsuming}
                     onclick={() => openResetCredits(conn)}
-                    aria-label="Redeem a Codex reset credit"
+                    aria-label="Redeem a {conn.provider === 'claude' ? 'Claude' : 'Codex'} reset credit"
                     title={resetCreditCount > 0
-                      ? `Redeem a Codex reset credit (${resetCreditCount} available)`
-                      : 'Check Codex reset credits'}
-                    class="flex h-8 min-w-10 items-center justify-center gap-1 rounded-lg border px-2 text-[11px] font-medium tabular-nums transition-colors disabled:cursor-not-allowed disabled:opacity-60 {resetCreditCount > 0 ? 'border-primary/30 bg-primary/5 text-primary hover:bg-primary/10' : 'border-border-subtle bg-surface-2 text-text-muted'}"
+                      ? `Redeem a ${conn.provider === 'claude' ? 'Claude' : 'Codex'} reset credit (${resetCreditCount} available)`
+                      : `Check ${conn.provider === 'claude' ? 'Claude' : 'Codex'} reset credits`}
+                    class="flex h-11 sm:h-8 min-w-10 items-center justify-center gap-1 rounded-lg border px-2 text-[11px] font-medium tabular-nums transition-colors disabled:cursor-not-allowed disabled:opacity-60 {resetCreditCount > 0 ? 'border-primary/30 bg-primary/5 text-primary hover:bg-primary/10' : 'border-border-subtle bg-surface-2 text-text-muted'}"
                   >
                     <span class="material-symbols-outlined text-[15px]">restart_alt</span>
                     <span>{resetCreditCount}</span>
                   </button>
                 {/if}
 
-                {#if (conn.provider === 'claude' || conn.provider === 'codex') && conn.authType === 'oauth'}
-                  {@const isAutoPingActive = autoPingMaps[conn.provider]?.[conn.id] === true}
+                {#if conn.provider === 'glm'}
+                  {@const resetCardsObj = (quota?.raw as { resetCards?: { availableCount?: number } } | undefined)?.resetCards}
+                  {@const resetCardCount = resetCardsObj?.availableCount ?? 0}
+                  <button
+                    type="button"
+                    disabled={isLoading || rowBusy || glmResetCardConsuming}
+                    onclick={() => openGlmResetCards(conn)}
+                    aria-label="Redeem a GLM reset card"
+                    title={resetCardCount > 0
+                      ? `Redeem a GLM reset card (${resetCardCount} available)`
+                      : 'Check GLM reset cards'}
+                    class="flex h-11 sm:h-8 min-w-10 items-center justify-center gap-1 rounded-lg border px-2 text-[11px] font-medium tabular-nums transition-colors disabled:cursor-not-allowed disabled:opacity-60 {resetCardCount > 0 ? 'border-primary/30 bg-primary/5 text-primary hover:bg-primary/10' : 'border-border-subtle bg-surface-2 text-text-muted'}"
+                  >
+                    <span class="material-symbols-outlined text-[15px]">restart_alt</span>
+                    <span>{resetCardCount}</span>
+                  </button>
+                {/if}
+
+                {#if supportsAutoPing(conn)}
+                  {@const autoPingProvider = conn.provider as AutoPingProvider}
+                  {@const isAutoPingActive = autoPingMaps[autoPingProvider]?.[conn.id] === true}
                   {@const hasSchedule =
-                    (autoPingSchedules[conn.provider]?.[conn.id] as { enabled?: boolean } | undefined)
-                      ?.enabled === true}
+                    (
+                      autoPingSchedules[autoPingProvider]?.[conn.id] as
+                        | { enabled?: boolean }
+                        | undefined
+                    )?.enabled === true}
                   <button
                     type="button"
                     onclick={() => toggleAutoPing(conn.id, conn.provider, !isAutoPingActive)}
                     title={AUTO_PING_TOOLTIPS[conn.provider]}
                     aria-label="Toggle auto-ping"
-                    class="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-surface-3 cursor-pointer {isAutoPingActive ? 'text-primary' : 'text-text-muted'}"
+                    class="tap-target flex h-11 sm:h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-surface-3 cursor-pointer {isAutoPingActive ? 'text-primary' : 'text-text-muted'}"
                   >
                     <span class="material-symbols-outlined text-[18px]">bolt</span>
                   </button>
@@ -1291,7 +1478,7 @@
                     onclick={() => (autoPingEditing = conn)}
                     title="Auto-ping schedule"
                     aria-label="Configure auto-ping schedule"
-                    class="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-surface-3 cursor-pointer {hasSchedule
+                    class="tap-target flex h-11 sm:h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-surface-3 cursor-pointer {hasSchedule
                       ? 'text-primary'
                       : 'text-text-muted'}"
                   >
@@ -1306,7 +1493,7 @@
                   disabled={isLoading || rowBusy}
                   aria-label="Refresh quota"
                   title="Refresh quota"
-                  class="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-surface-3 hover:text-text-main disabled:opacity-50 cursor-pointer"
+                  class="tap-target flex h-11 sm:h-8 w-8 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-surface-3 hover:text-text-main disabled:opacity-50 cursor-pointer"
                 >
                   <span
                     class="material-symbols-outlined text-[18px] {isLoading
@@ -1322,7 +1509,7 @@
                   disabled={rowBusy}
                   aria-label="Edit connection"
                   title="Edit connection"
-                  class="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-surface-3 hover:text-primary disabled:opacity-50 cursor-pointer"
+                  class="tap-target flex h-11 sm:h-8 w-8 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-surface-3 hover:text-primary disabled:opacity-50 cursor-pointer"
                 >
                   <span class="material-symbols-outlined text-[18px]">edit</span>
                 </button>
@@ -1334,7 +1521,7 @@
                   disabled={rowBusy}
                   aria-label="Delete connection"
                   title="Delete connection"
-                  class="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-red-500/10 hover:text-red-500 disabled:opacity-50 cursor-pointer"
+                  class="tap-target flex h-11 sm:h-8 w-8 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-red-500/10 hover:text-red-500 disabled:opacity-50 cursor-pointer"
                 >
                   <span
                     class="material-symbols-outlined text-[18px] {deletingId === conn.id
@@ -1414,6 +1601,10 @@
             {/if}
           </div>
         </div>
+              {/each}
+            </div>
+          {/if}
+        </section>
       {/each}
     </div>
 
@@ -1459,7 +1650,7 @@
             type="button"
             onclick={() => (page = 1)}
             disabled={pagination.page <= 1 || connectionsLoading || refreshingAll}
-            class="flex h-8 items-center rounded-lg border border-border-subtle px-3 text-xs text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
+            class="flex h-11 sm:h-8 items-center rounded-lg border border-border-subtle px-3 text-xs text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
           >
             First Page
           </button>
@@ -1468,7 +1659,7 @@
             onclick={() => (page = Math.max(1, page - 1))}
             disabled={pagination.page <= 1 || connectionsLoading || refreshingAll}
             aria-label="Previous accounts page"
-            class="flex h-8 w-8 items-center justify-center rounded-lg border border-border-subtle text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
+            class="tap-target flex h-11 sm:h-8 w-8 items-center justify-center rounded-lg border border-border-subtle text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <span class="material-symbols-outlined text-[16px]">chevron_left</span>
           </button>
@@ -1477,7 +1668,7 @@
             onclick={() => (page = Math.min(pagination.totalPages, page + 1))}
             disabled={pagination.page >= pagination.totalPages || connectionsLoading || refreshingAll}
             aria-label="Next accounts page"
-            class="flex h-8 w-8 items-center justify-center rounded-lg border border-border-subtle text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
+            class="tap-target flex h-11 sm:h-8 w-8 items-center justify-center rounded-lg border border-border-subtle text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <span class="material-symbols-outlined text-[16px]">chevron_right</span>
           </button>
@@ -1485,7 +1676,7 @@
             type="button"
             onclick={() => (page = pagination.totalPages)}
             disabled={pagination.page >= pagination.totalPages || connectionsLoading || refreshingAll}
-            class="flex h-8 items-center rounded-lg border border-border-subtle px-3 text-xs text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
+            class="flex h-11 sm:h-8 items-center rounded-lg border border-border-subtle px-3 text-xs text-text-main transition-colors hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Last Page
           </button>
@@ -1509,9 +1700,9 @@
   <AutoPingScheduleModal
     open
     connectionName={autoPingEditing.name}
-    reactive={autoPingMaps[autoPingEditing.provider as 'claude' | 'codex']?.[autoPingEditing.id] ===
+    reactive={autoPingMaps[autoPingEditing.provider as AutoPingProvider]?.[autoPingEditing.id] ===
       true}
-    schedule={(autoPingSchedules[autoPingEditing.provider as 'claude' | 'codex']?.[
+    schedule={(autoPingSchedules[autoPingEditing.provider as AutoPingProvider]?.[
       autoPingEditing.id
     ] as AutoPingSchedule | null) ?? null}
     timezone={localTimezone}
@@ -1529,7 +1720,7 @@
     ></div>
     <div class="relative w-full max-w-md bg-surface border border-border-subtle rounded-[14px] shadow-[var(--shadow-elev)] p-6">
       <div class="flex items-center justify-between pb-3 border-b border-border-subtle mb-4">
-        <h2 class="text-lg font-semibold text-text-main">Redeem a reset credit</h2>
+        <h2 class="text-lg font-semibold text-text-main">Redeem a {resetCreditConn?.provider === 'claude' ? 'Claude' : 'Codex'} reset credit</h2>
         <button
           type="button"
           onclick={closeResetCredits}
@@ -1564,7 +1755,7 @@
         {/if}
       {:else}
       <p class="text-xs text-text-muted mb-4">
-        Redeeming a credit resets the Codex usage window immediately instead of waiting for the
+        Redeeming a credit resets the {resetCreditConn?.provider === 'claude' ? 'Claude' : 'Codex'} usage window immediately instead of waiting for the
         countdown to run out.
       </p>
 
@@ -1646,6 +1837,137 @@
             type="button"
             onclick={closeResetCredits}
             disabled={resetCreditConsuming}
+            class="px-3 py-2 rounded-lg border border-border text-xs font-semibold text-text-main hover:bg-surface-2 transition-colors disabled:opacity-50 cursor-pointer"
+          >
+            Close
+          </button>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if glmResetCardConn}
+  <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div
+      class="absolute inset-0 bg-black/50 backdrop-blur-[2px]"
+      onclick={closeGlmResetCards}
+      role="presentation"
+    ></div>
+    <div class="relative w-full max-w-md bg-surface border border-border-subtle rounded-[14px] shadow-[var(--shadow-elev)] p-6">
+      <div class="flex items-center justify-between pb-3 border-b border-border-subtle mb-4">
+        <h2 class="text-lg font-semibold text-text-main">Redeem a GLM reset card</h2>
+        <button
+          type="button"
+          onclick={closeGlmResetCards}
+          disabled={glmResetCardConsuming}
+          class="text-text-muted hover:text-text-main transition-colors disabled:opacity-50 cursor-pointer"
+          aria-label="Close"
+        >
+          <span class="material-symbols-outlined">close</span>
+        </button>
+      </div>
+
+      {#if glmResetCardConfirming && glmResetCardPending}
+        <div class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+          <div class="flex items-start gap-3">
+            <span class="material-symbols-outlined text-amber-500">warning</span>
+            <div class="min-w-0">
+              <p class="font-semibold text-text-main">Redeem this reset card?</p>
+              <p class="mt-1 text-sm text-text-muted">
+                This will immediately reset your GLM quota window. The card will be consumed permanently.
+              </p>
+            </div>
+          </div>
+        </div>
+        <div class="mt-3 rounded-lg border border-border-subtle px-3 py-2.5">
+          <p class="text-sm font-medium text-text-main">
+            {glmResetCardPending.type === 'FIVE_HOUR' ? '5-Hour Reset' : 'Weekly Reset'}
+          </p>
+          <p class="mt-0.5 text-[11px] text-text-muted">
+            Expires {new Date(glmResetCardPending.expiresAt).toLocaleString()}
+          </p>
+        </div>
+        {#if glmResetCardError}
+          <p class="mt-3 text-xs text-red-500">{glmResetCardError}</p>
+        {/if}
+      {:else}
+      <p class="text-xs text-text-muted mb-4">
+        Redeeming a card resets the GLM usage window immediately instead of waiting for the
+        countdown to run out. FIVE_HOUR cards reset the 5-hour window; WEEK cards reset the weekly quota.
+      </p>
+
+      {#if glmResetCardLoading}
+        <p class="text-sm text-text-muted py-4 text-center">Loading reset cards…</p>
+      {:else if glmResetCardError && glmResetCardList.length === 0}
+        <p class="text-sm text-red-500 py-4 text-center">{glmResetCardError}</p>
+      {:else if glmResetCardList.length === 0 && glmResetCardCount > 0}
+        <p class="text-sm text-text-muted py-4 text-center">
+          Card details are currently unavailable. Refresh and try again.
+        </p>
+      {:else if glmResetCardList.length === 0}
+        <p class="text-sm text-text-muted py-4 text-center">No reset cards are available on this account.</p>
+      {:else}
+        <div class="space-y-2 max-h-64 overflow-y-auto">
+          {#each glmResetCardList as credit, index (credit.recordId)}
+            <div
+              class="flex flex-col gap-3 rounded-lg border px-3 py-2.5 sm:flex-row sm:items-center {glmResetCardSelected ===
+              credit.recordId
+                ? 'border-primary/40 bg-primary/5'
+                : 'border-border-subtle'}"
+            >
+              <span class="min-w-0 flex-1">
+                <span class="block text-sm font-medium text-text-main">
+                  {credit.type === 'FIVE_HOUR' ? '5-Hour Reset' : 'Weekly Reset'}
+                  {#if index === 0}
+                    <span class="ml-1 text-[10px] font-semibold text-primary">recommended</span>
+                  {/if}
+                </span>
+                <span class="block text-[11px] text-text-muted">
+                  Expires {new Date(credit.expiresAt).toLocaleString()}
+                </span>
+              </span>
+              <button
+                type="button"
+                onclick={() => requestGlmResetCard(credit)}
+                disabled={glmResetCardConsuming}
+                class="shrink-0 px-2.5 py-1.5 rounded-lg bg-primary text-[11px] font-semibold text-white hover:bg-primary-hover transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                Redeem
+              </button>
+            </div>
+          {/each}
+        </div>
+
+        {#if glmResetCardError}
+          <p class="mt-3 text-xs text-red-500">{glmResetCardError}</p>
+        {/if}
+      {/if}
+      {/if}
+
+      <div class="flex justify-end gap-2 mt-5">
+        {#if glmResetCardConfirming && glmResetCardPending}
+          <button
+            type="button"
+            onclick={backToGlmResetCardList}
+            disabled={glmResetCardConsuming}
+            class="px-3 py-2 rounded-lg border border-border text-xs font-semibold text-text-main hover:bg-surface-2 transition-colors disabled:opacity-50 cursor-pointer"
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            onclick={confirmGlmResetCard}
+            disabled={glmResetCardConsuming}
+            class="px-3 py-2 rounded-lg bg-primary text-xs font-semibold text-white hover:bg-primary-hover transition-colors disabled:opacity-50 cursor-pointer"
+          >
+            {glmResetCardConsuming ? 'Redeeming…' : 'Redeem card'}
+          </button>
+        {:else}
+          <button
+            type="button"
+            onclick={closeGlmResetCards}
+            disabled={glmResetCardConsuming}
             class="px-3 py-2 rounded-lg border border-border text-xs font-semibold text-text-main hover:bg-surface-2 transition-colors disabled:opacity-50 cursor-pointer"
           >
             Close
